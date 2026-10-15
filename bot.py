@@ -132,7 +132,13 @@ STICKER_HINT = (
     "{items}\n"
     "想顺便甩张表情的时候,在回复最后另起一行写 `[STICKER] 文件名`。\n"
     "文件名必须从上面原样抄一个,不要自己编,也不要写标签。\n"
-    "大约每三四条回复才发一次,不要连着发;正经回答、算数、查资料这类一律不发。"
+    "注意:\n"
+    "1. 情绪对得上就发,别太保守;但正经回答、算数、查资料、安慰人这类别发。\n"
+    "2. 别每次都挑同一张,尤其不要老是挑「得意」那几张。\n"
+    "3. 看清方向:被调侃、被说笨、被吐槽的时候,不要挑得意或炫耀的图;"
+    "那种时候该挑委屈、奶凶、无语、装傻的。\n"
+    "4. 大约每三四条回复才发一次,不要连着发。\n"
+    "5. 正文照常写,不要只写标记。"
 )
 
 
@@ -220,6 +226,8 @@ class Bot:
         ]
         # 每个会话最近发过的图,供紧接着的追问使用
         self.recent_images: dict[str, tuple[float, list[str]]] = {}
+        # 每个会话最近发过的表情包,免得老是甩同一张
+        self.recent_stickers: dict[str, list[str]] = defaultdict(list)
         # 本地表情包库(读不到就是空的,功能自动隐身)
         self.stickers, self.sticker_tags = self._load_stickers()
 
@@ -259,26 +267,40 @@ class Bot:
             lines.append(f"{item['file']}｜{emotion}｜{scene}")
         return "\n".join(lines)
 
-    def pick_sticker(self, tag: str = "") -> Path | None:
-        """挑一张表情包:优先按文件名认(模型直接点名),再按情绪/关键词/场景找,都没有就随机。"""
+    def pick_sticker(self, tag: str = "", session_key: str = "") -> Path | None:
+        """挑一张表情包:优先按文件名认(模型直接点名),再按情绪/关键词/场景找,都没有就随机。
+
+        模型有很强的默认偏好(会反复点同一张),所以同一个会话最近发过的先避开。
+        """
         if not self.stickers:
             return None
+        sent = self.recent_stickers.get(session_key or "", [])
+        fresh = [i for i in self.stickers if i["file"] not in sent] or self.stickers
+
         key = tag.strip().strip("`。.,、 ").split()[0] if tag.strip() else ""
         if key:
             for item in self.stickers:
                 name = item["file"]
                 if key == name or key == Path(name).stem or key in name:
-                    return STICKER_DIR / name
+                    if item["file"] not in sent:
+                        return STICKER_DIR / name
+                    break  # 刚发过,换个同情绪的
             # 标签对不上时再拿关键词和「这图是干嘛用的」那句话兜一下
             hit = [
                 item
-                for item in self.stickers
+                for item in fresh
                 if any(key in t or t in key for t in item.get("tags") or [])
                 or key in (item.get("scene") or "")
             ]
             if hit:
                 return STICKER_DIR / random.choice(hit)["file"]
-        return STICKER_DIR / random.choice(self.stickers)["file"]
+        return STICKER_DIR / random.choice(fresh)["file"]
+
+    def remember_sticker(self, session_key: str, name: str, keep: int = 6) -> None:
+        """记住这个会话刚发过哪几张,免得连着刷同一张。"""
+        sent = self.recent_stickers[session_key]
+        sent.append(name)
+        del sent[:-keep]
 
     # ---------- 域名白名单 ----------
 
@@ -862,10 +884,11 @@ class Bot:
         # /表情 [标签]:手动要一张表情包
         if ask_text.startswith("/表情"):
             tag = ask_text[len("/表情"):].strip()
-            sticker = self.pick_sticker(tag)
+            sticker = self.pick_sticker(tag, session_key)
             if sticker:
                 log.info("手动发表情包:%s(%s)", sticker.name, tag or "随机")
                 await self.send_sticker(event, sticker)
+                self.remember_sticker(session_key, sticker.name)
             else:
                 await self.reply(event, "表情包库是空的,往 表情包/ 里丢几张图就有了")
             return
@@ -946,13 +969,14 @@ class Bot:
             if sticker_tag and random.random() < float(
                 self.cfg.get("sticker_chance", 0.4)
             ):
-                sticker = self.pick_sticker(sticker_tag)
+                sticker = self.pick_sticker(sticker_tag, session_key)
             log.info("表情包:%s(%s)", sticker.name if sticker else "不发", sticker_tag or "-")
 
             if answer:
                 await self.reply(event, answer)
             if sticker:
                 await self.send_sticker(event, sticker)
+                self.remember_sticker(session_key, sticker.name)
 
             # 联网搜索顺手把相关图片也发过去
             if img_keyword and self.cfg.get("search_images", True):

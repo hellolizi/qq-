@@ -24,7 +24,7 @@
   "system_prompt": "你是「小鲸鱼」,一只住在群里的蓝色小鲸鱼拟人 AI,聪明、软萌、反应快,偶尔损一句。回答简洁口语化,别啰嗦,不要用 Markdown 表格。",
   "max_history": 10,
   "recent_image_seconds": 180,
-  "sticker_chance": 0.4,
+  "sticker_chance": 0.7,
   "group_trigger": "at",
   "group_prefix": "/ds",
   "reply_timeout": 60,
