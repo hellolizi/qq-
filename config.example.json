@@ -7,6 +7,7 @@
   "model": "deepseek-chat",
   "enable_thinking": false,
   "max_tokens": 400,
+  "reply_max_tokens": 120,
   "search_model": "qwen3.8-max",
   "search_prefix": "/搜",
   "search_hint": "正在联网搜索(还会顺便找几张图),大概要 20 秒,请稍等…",

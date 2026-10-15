@@ -78,7 +78,14 @@ ROUTING_HINT = (
     "(除了这一行不要有任何别的字),描述要具体。\n"
     "2. 如果用户只是在问你有没有画图能力,或者只是聊天里提到「画」字,"
     "都当普通聊天正常回话,不要输出 [DRAW]。\n"
-    "3. 其他任何情况都正常聊天。"
+    "3. 其他任何情况都正常聊天。\n"
+    "4. 群聊回复必须短:1~2 句、40 字以内。像普通人发微信那样说话——"
+    "口语、短句,可以不带标点结尾,不许写列表、标题、Markdown、分点罗列。\n"
+    "5. 只有用户明确说「详细讲讲」「解释下原理」时才展开,"
+    "展开也只讲结论和要点,不要铺垫,不要总结收尾。\n"
+    "6. 别露出 AI 味:不要说「作为AI」「请问有什么可以帮您」「希望以上内容对您有帮助」"
+    "这类客服话术;不要解释自己在干什么,不要升华总结,不要每次都热情收尾。\n"
+    "7. emoji 和颜文字最多一个,大多数时候一个都别用。"
 )
 
 
@@ -338,8 +345,12 @@ class Bot:
             model = self.cfg.get("model", "")
 
         payload: dict[str, Any] = {"model": model, "messages": messages, "stream": False}
+        # 聊天回复单独限长:max_tokens 还要留给生图提示词用,别一起调小
+        payload["max_tokens"] = int(
+            self.cfg.get("reply_max_tokens") or self.cfg.get("max_tokens", 400)
+        )
         # 把 config 里额外的 OpenAI 兼容参数原样透传
-        for key in ("max_tokens", "temperature", "top_p"):
+        for key in ("temperature", "top_p"):
             if key in self.cfg:
                 payload[key] = self.cfg[key]
         if use_search and not images:
