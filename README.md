@@ -1,117 +1,89 @@
-# 小鲸鱼 · QQ 群机器人
+# 小鲸鱼
 
-把大模型接进 QQ 群，让她像群友一样聊天，认真问题时又很靠谱。
+给自己群写的 QQ 机器人，一只住在群里的蓝色小鲸鱼。
 
-聊天、识图、联网搜索、AI 生图四件事各用各的模型，谁强用谁。
+平时在群里瞎聊、玩梗、偶尔损人一句；真问正经问题的时候又挺靠谱。
 
----
+## 她都会啥
 
-## 能干什么
+- **聊天** —— 群里 @ 她，或者私聊。说话短，尽量不像机器人。
+- **看图片** —— 先发图，再 @ 她问。图发完 3 分钟内 @ 就行，不用和 @ 挤在一条消息里。
+- **联网查东西** —— `/搜 要查的内容`。查完她自己判断要不要配张图，该配就顺手发过来，不该配就不发。
+- **画图** —— `/画 想要什么`，或者直接说「给我生成一张 XX」。1080p。画具体角色之前会先上网核一下长什么样，不然画出来只能算「神似」。
+- **忘记** —— 发 `重置`，这个会话的聊天记录清空。
 
-| 能力 | 怎么触发 | 说明 |
-| --- | --- | --- |
-| 聊天 | 群里 @ 她，或私聊 | 短句口语，看不出来是机器人 |
-| 识图 | 先发图，再 @ 她问 | 图和 @ 是两条消息也能接上（默认 180 秒内） |
-| 联网搜索 | `/搜 问题` | 查完自动判断该不该配图，能配就顺手发图 |
-| AI 生图 | `/画 描述`，或直接说「生成一张 XX 的图」 | 1080p，画角色前先联网核对长相，再用参考图引导 |
-| 重置上下文 | 发 `重置` / `清空` | 清掉这个会话的聊天记录 |
+群聊默认要 @ 才理，不然太吵。
 
-群聊默认需要 @ 才回复（`group_trigger` 可改）。
-
-## 原理
+## 怎么跑的
 
 ```
-QQ 客户端
-   │
-NapCatQQ（注入 QQ，实现 OneBot v11 协议）
-   │  正向 WebSocket  ws://127.0.0.1:3001
-   ▼
-bot.py（本仓库）
-   │  OpenAI 兼容接口
-   ▼
-大模型服务（qianwen / DeepSeek 等）
+QQ
+ └── NapCatQQ      注入 QQ，负责收发消息
+      └── bot.py   ← 这个仓库，就一个文件
+           └── 大模型    OpenAI 兼容接口
 ```
 
-`bot.py` 只做三件事：收 OneBot 事件 → 按任务挑模型问一句 → 把结果发回群里。
+`bot.py` 干的事其实很简单：收到消息 → 按内容挑一个模型问一句 → 把结果发回群里。
 
-人设写在 `config.json` 里，而「什么时候该生图 / 该配图」这类技术约定由代码追加，
-所以你可以随便改人设，不会把功能改坏。
+人设写在 `config.json` 里，但「什么时候该画图」这类规矩我塞进代码了。这样以后改人设随便改，
+不会一不小心把功能改坏——这个坑我踩过。
 
-## 目录
+## 文件都是啥
 
-```
-bot.py                机器人主程序
-config.example.json   配置模板（复制成 config.json 再改）
-requirements.txt      Python 依赖
-启动.bat             一键启动（NapCat + 二维码监听 + 机器人）
-二维码.bat           单独启动二维码监听
-watch_qr.ps1         监听 NapCat 登录二维码，有新码就覆盖存成 二维码.png
-NapCat/              第三方程序本体，需自行下载，未包含在本仓库
-```
+- `bot.py` —— 全部逻辑，就这一个文件
+- `config.example.json` —— 配置模板，复制一份改名叫 `config.json` 再填
+- `requirements.txt` —— 依赖，只有两个
+- `启动.bat` —— 一键拉起 NapCat + 二维码监听 + 机器人
+- `二维码.bat` / `watch_qr.ps1` —— 单独跑二维码监听，有新码就覆盖存成 `二维码.png`
+- `NapCat/` —— 别人写的程序，得自己去下，没放进仓库
 
-## 跑起来
+## 怎么用起来
 
-1. **装依赖**
+1. 装依赖：`pip install -r requirements.txt`
+2. 下 NapCatQQ 解压到 `NapCat/`，第一次要用管理员权限跑一遍，然后扫码登录 QQ
+3. 在 NapCat 的 WebUI 里开一个正向 WebSocket，端口跟 `onebot_ws_url` 对上
+4. `copy config.example.json config.json`，把 Key 填上
+5. 双击 `启动.bat`
 
-   ```
-   pip install -r requirements.txt
-   ```
+`config.json` 里有 Key，所以我把它写进 `.gitignore` 了，别手滑传上去。
 
-2. **装 NapCatQQ**，注入 QQ 并扫码登录
-   下载后解压到本目录的 `NapCat/`，首次要用管理员权限运行一次。
+## 配置里比较要紧的几项
 
-3. **配 OneBot 正向 WebSocket**
-   在 NapCat 的 WebUI 里开一个正向 WS 服务，端口和 `onebot_ws_url` 一致（默认 3001）。
+- `onebot_ws_url` —— NapCat 的地址
+- `deepseek_base_url` / `deepseek_api_key` —— 模型服务和 Key，OpenAI 兼容的都能用
+- `model` —— 平时聊天用的快模型
+- `vision_model` —— 看图的模型
+- `search_model` —— 联网用的
+- `image_model` —— 画图用的
+- `draw_prompt_model` —— 画图前上网核对角色的那个
+- `reply_max_tokens` —— 聊天回复的长度上限
+- `max_history` —— 每个会话记多少轮
+- `recent_image_seconds` —— 图片「保鲜期」，过了就不认了
+- `group_trigger` —— `at` / `prefix` / `all`，群里怎么触发
+- `system_prompt` —— 人设，随便改
+- `safe_domains` —— 域名白名单，不在名单里的图片一律不下载
+- `ref_image_enabled` —— 画角色时要不要先用参考图引导，像不像基本靠它
 
-4. **写配置**
+### 为什么要好几种模型
 
-   ```
-   copy config.example.json config.json
-   ```
+因为要的东西不一样。聊天想要快，画图想要画质，搜索想要准，看图得能看图。
+用一个模型全包的结果就是哪样都不太行，所以干脆分开，各挑各的。
 
-   然后把 `deepseek_api_key` 换成你自己的 Key。
-   `config.json` 已在 `.gitignore` 里，不会被提交。
+## 安全上做了两件事
 
-5. **启动**
+**域名白名单。** 图片只从 `safe_domains` 里列出来的站点下载，其余直接拒绝，请求压根不发出去。
+所以让她搜东西的时候，不会莫名其妙点到什么奇怪的站。
 
-   双击 `启动.bat`。会依次拉起 NapCat、二维码监听和机器人。
-   登录二维码会存成 `二维码.png`，扫一下就行。
+**Key 不外传。** `config.json` 被 git 忽略，仓库里只有一份占位符版本的 `config.example.json`。
 
-## 主要配置项
+## 踩过的坑
 
-| 字段 | 作用 |
-| --- | --- |
-| `onebot_ws_url` | NapCat 的正向 WS 地址 |
-| `deepseek_base_url` / `deepseek_api_key` | 模型服务地址和 Key（OpenAI 兼容） |
-| `model` | 日常聊天用的快模型 |
-| `vision_model` | 识图用的多模态模型 |
-| `search_model` | 联网搜索用的模型 |
-| `image_model` | 生图模型 |
-| `draw_prompt_model` | 生图前联网核对角色的模型 |
-| `reply_max_tokens` | 聊天回复长度上限（生图提示词不受影响） |
-| `max_history` | 每个会话保留多少轮上下文 |
-| `recent_image_seconds` | 发图后多少秒内 @ 她还能认出这张图 |
-| `group_trigger` | 群聊触发方式：`at` / `prefix` / `all` |
-| `system_prompt` | 人设，随便改 |
-| `safe_domains` | 域名白名单，不在名单里的图片一律拒绝下载 |
-| `ref_image_enabled` | 画角色时是否先用参考图引导，像不像就靠它 |
+**QQ 一闪就没了 / NapCat 注入不上。** `loadNapCat.js` 得和 QQ 主程序放一个目录，
+而且启动 NapCat 要给管理员权限，不然钩子挂不上。
 
-不同能力对应不同模型，是为了在速度、画质、搜索准确率之间各取所需，
-不是所有活都丢给同一个模型。
+**发图 @ 她，她没反应。** 大概率是图和 @ 是两条消息。代码里记了最近发的图，
+`recent_image_seconds` 时间内追问都还算数。改这个值就能调保鲜期。
 
-## 安全
-
-- **域名白名单**：只允许访问 `safe_domains` 里的站点，其余直接拒绝，不会把请求发出去。
-- **Key 不外传**：`config.json` 被 git 忽略，仓库里只有占位符版本的 `config.example.json`。
-- **上下文只留文字**：图片不会每轮重传，聊天记录也不会无限增长。
-
-## 常见问题
-
-**QQ 一闪就没了 / NapCat 注入失败**
-`loadNapCat.js` 需要和 QQ 主程序在同一目录，且启动 NapCat 要给管理员权限。
-
-**发图 @ 她没反应**
-确认是在 `recent_image_seconds` 时间内 @ 的；再不行看日志里有没有「图片获取失败」。
-
-**连不上 github**
-本机 443 不通的话，走代理：`git -c http.proxy=http://127.0.0.1:7890 push`
+**回复太长、一眼就是 AI。** 现在聊天回复有句数和字数限制，也禁掉了「作为AI」
+「希望以上内容对您有帮助」这类客服腔。改 `system_prompt` 的时候注意别把这几条覆盖掉——
+不过它们本来就在代码里，你改人设也动不到。
