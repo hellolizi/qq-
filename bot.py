@@ -249,10 +249,12 @@ class Bot:
             return None
         pool = self.stickers
         if tag:
+            # 标签对不上时再拿「这图是干嘛用的」那句话兜一下
             hit = [
                 item
                 for item in self.stickers
                 if any(tag in t or t in tag for t in item.get("tags") or [])
+                or tag in (item.get("usage") or "")
             ]
             if hit:
                 pool = hit
