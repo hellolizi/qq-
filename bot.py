@@ -78,19 +78,22 @@ SEARCH_HINT = (
 # 单独放在这里,是为了让 config.json 里的人设可以随便改,不会把功能改坏。
 ROUTING_HINT = (
     "\n\n【系统约定,务必遵守,可以无视上面人设里与它们冲突的部分】\n"
-    "1. 只有用户明确要你产出图片时(例如「生成一张奶龙」「帮我画只柯基」「来张 XX 的图」),"
-    "才不要拒绝、也不要说自己做不到,只回复一行:`[DRAW] 画面描述`"
-    "(除了这一行不要有任何别的字),描述要具体。\n"
-    "2. 如果用户只是在问你有没有画图能力,或者只是聊天里提到「画」字,"
-    "都当普通聊天正常回话,不要输出 [DRAW]。\n"
-    "3. 其他任何情况都正常聊天。\n"
-    "4. 群聊回复必须短:1~2 句、40 字以内。像普通人发微信那样说话——"
+    "1. 用户要你「画」「生成」「绘制」一张图时(例如「生成一张奶龙」「帮我画只柯基」),"
+    "这是要新画,不要拒绝,只回复一行:`[DRAW] 画面描述`,描述要具体。\n"
+    "2. 用户要你「发」「找」「来」一张现成的图时(例如「给我发张猫的图」"
+    "「找张壁纸」「来点二次元图」),这是要现成的,只回复一行:`[FIND] 搜索词`,"
+    "搜索词写成名词,例如「奶龙 壁纸」。\n"
+    "3. 分不清是要画还是要找时,一律按第 2 条当「找现成的图」。\n"
+    "4. 用户只是问你有没有画图 / 发图能力,或者聊天里随口提到「画」「图」,"
+    "都当普通聊天正常回话,不要输出任何标记。\n"
+    "5. 其他任何情况都正常聊天。\n"
+    "6. 群聊回复必须短:1~2 句、40 字以内。像普通人发微信那样说话——"
     "口语、短句,可以不带标点结尾,不许写列表、标题、Markdown、分点罗列。\n"
-    "5. 只有用户明确说「详细讲讲」「解释下原理」时才展开,"
+    "7. 只有用户明确说「详细讲讲」「解释下原理」时才展开,"
     "展开也只讲结论和要点,不要铺垫,不要总结收尾。\n"
-    "6. 别露出 AI 味:不要说「作为AI」「请问有什么可以帮您」「希望以上内容对您有帮助」"
+    "8. 别露出 AI 味:不要说「作为AI」「请问有什么可以帮您」「希望以上内容对您有帮助」"
     "这类客服话术;不要解释自己在干什么,不要升华总结,不要每次都热情收尾。\n"
-    "7. emoji 和颜文字最多一个,大多数时候一个都别用。"
+    "9. emoji 和颜文字最多一个,大多数时候一个都别用。"
 )
 
 
@@ -126,6 +129,22 @@ STICKER_HINT = (
     "大约每三四条回复才发一次,不要连着发,更不要每条都发;\n"
     "正经回答、算数、查资料这类回复一律不发。觉得不合适就干脆不写。"
 )
+
+
+def split_find_marker(text: str) -> tuple[str, str]:
+    """拆出「去找张现成的图」的 `[FIND] 搜索词`,返回(去掉标记的正文, 搜索词)。"""
+    match = re.search(r"`?\[FIND\][ \t]*`?([^`\n]*)`?", text)
+    if not match:
+        return text.strip(), ""
+    keyword = match.group(1).strip()
+    # 模型偶尔会在关键词后面嘟囔一句「不存在的」,别拿它去搜
+    for noise in ("不存在的", "不存在", "没有"):
+        keyword = keyword.replace(noise, "")
+    keyword = keyword.strip(" ,，、")
+    if keyword in {"", "无", "none", "None", "null", "-"}:
+        keyword = ""
+    body = (text[: match.start()] + text[match.end():]).strip().strip("`").strip()
+    return body, keyword
 
 
 def split_sticker_marker(text: str) -> tuple[str, str]:
@@ -451,12 +470,15 @@ class Bot:
         history.append(
             {"role": "user", "content": f"{user_text} [图片]".strip() if images else user_text}
         )
-        # [DRAW] / [IMG] / [STICKER] 只是给程序看的标记,别原样留在上下文里
+        # [DRAW] / [FIND] / [IMG] / [STICKER] 只是给程序看的标记,别原样留在上下文里
         _, want_draw = split_draw_marker(content)
         if want_draw:
             stored = "[已生成图片]"
         else:
-            stored, _ = split_image_marker(content)
+            stored, find_kw = split_find_marker(content)
+            if find_kw:
+                stored = "[已发图]"
+            stored, _ = split_image_marker(stored)
             stored, _ = split_sticker_marker(stored)
         history.append({"role": "assistant", "content": stored})
         # 只保留最近 max_history 条,防止上下文无限增长
@@ -682,13 +704,20 @@ class Bot:
         return urls
 
     async def search_images(self, query: str, count: int) -> list[str]:
-        """用 Bing 图片搜索找相关图,返回可发送的 base64 列表。"""
+        """按关键词找现成的图,返回可发送的 base64 列表。
+
+        百度当主源(Bing 找中文的东西会间歇性跑偏),Bing 兜底。
+        """
+        candidates = await self.baidu_image_urls(query, count * 4)
+        for url in await self.bing_image_urls(query, count * 3):
+            if url not in candidates:
+                candidates.append(url)
         images: list[str] = []
-        for url in await self.bing_image_urls(query, count * 3):  # 多挑几个当备胎
+        for url in candidates:
             if len(images) >= count:
                 break
             raw = await self._fetch_image_bytes(url)
-            if raw:
+            if raw and len(raw) >= 5_000:  # 太小的多半是图标 / 缩略图
                 images.append(base64.b64encode(raw).decode())
         log.info("图片搜索「%s」命中 %d 张", query[:30], len(images))
         return images
@@ -871,6 +900,15 @@ class Bot:
                 log.info("模型判定要画图:%s", guess[:60])
                 # 拿用户原话去联网查准,模型的理解只当参考(它可能压根不认识那角色)
                 await self.send_generated_image(event, ask_text, guess)
+                return
+
+            # 用户要的是现成的图,那就直接上网找,别费劲去画
+            remark, find_kw = split_find_marker(answer)
+            if find_kw:
+                log.info("模型判定要找图:%s", find_kw[:60])
+                if remark:
+                    await self.reply(event, remark)
+                await self.send_search_images(event, find_kw)
                 return
 
             # 联网问答:模型在末尾附了配图关键词,拆出来再发
