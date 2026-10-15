@@ -121,13 +121,18 @@ def split_ref_marker(text: str) -> tuple[str, str]:
     return body, name
 
 
-# 模型想发表情包时用的标记。标签清单是运行时按表情包库生成再拼进来的。
+# 这些只是来源分类,不算情绪
+STICKER_CHAR_TAGS = {"奶龙", "二次元", "奶龙动图", "二次元动图"}
+
+# 模型想发表情包时用的标记。清单是运行时按表情包库生成再拼进来的。
+# 直接把每张图「什么情绪、什么场合用」摊给它看,让它点名要哪张 ——
+# 比只丢一串抽象标签准得多。
 STICKER_HINT = (
-    "\n\n【表情包】\n"
-    "情绪到了的时候,可以在回复最后另起一行写:`[STICKER] 标签`,\n"
-    "表示「顺便甩张表情包」。标签只能从这份清单里挑一个:{tags}\n"
-    "大约每三四条回复才发一次,不要连着发,更不要每条都发;\n"
-    "正经回答、算数、查资料这类回复一律不发。觉得不合适就干脆不写。"
+    "\n\n【能发的表情包】格式:文件名|情绪|什么时候用\n"
+    "{items}\n"
+    "想顺便甩张表情的时候,在回复最后另起一行写 `[STICKER] 文件名`。\n"
+    "文件名必须从上面原样抄一个,不要自己编,也不要写标签。\n"
+    "大约每三四条回复才发一次,不要连着发;正经回答、算数、查资料这类一律不发。"
 )
 
 
@@ -243,22 +248,37 @@ class Bot:
             log.info("表情包库:%d 张 / %d 个标签", len(images), len(tags))
         return images, tags
 
+    def sticker_list_text(self) -> str:
+        """把表情包摊成一行一张的清单,喂给模型让它点名。"""
+        lines = []
+        for item in self.stickers:
+            emotion = item.get("emotion") or next(
+                (t for t in item.get("tags") or [] if t not in STICKER_CHAR_TAGS), ""
+            )
+            scene = item.get("scene") or item.get("usage") or ""
+            lines.append(f"{item['file']}｜{emotion}｜{scene}")
+        return "\n".join(lines)
+
     def pick_sticker(self, tag: str = "") -> Path | None:
-        """按标签挑一张表情包,没标签或没匹配上就随机来一张。"""
+        """挑一张表情包:优先按文件名认(模型直接点名),再按情绪/关键词/场景找,都没有就随机。"""
         if not self.stickers:
             return None
-        pool = self.stickers
-        if tag:
-            # 标签对不上时再拿「这图是干嘛用的」那句话兜一下
+        key = tag.strip().strip("`。.,、 ").split()[0] if tag.strip() else ""
+        if key:
+            for item in self.stickers:
+                name = item["file"]
+                if key == name or key == Path(name).stem or key in name:
+                    return STICKER_DIR / name
+            # 标签对不上时再拿关键词和「这图是干嘛用的」那句话兜一下
             hit = [
                 item
                 for item in self.stickers
-                if any(tag in t or t in tag for t in item.get("tags") or [])
-                or tag in (item.get("usage") or "")
+                if any(key in t or t in key for t in item.get("tags") or [])
+                or key in (item.get("scene") or "")
             ]
             if hit:
-                pool = hit
-        return STICKER_DIR / random.choice(pool)["file"]
+                return STICKER_DIR / random.choice(hit)["file"]
+        return STICKER_DIR / random.choice(self.stickers)["file"]
 
     # ---------- 域名白名单 ----------
 
@@ -425,8 +445,8 @@ class Bot:
         system_prompt = (self.cfg.get("system_prompt") or "") + ROUTING_HINT
         if use_search and not images:
             system_prompt += SEARCH_HINT
-        if self.sticker_tags and not images:
-            system_prompt += STICKER_HINT.format(tags="、".join(self.sticker_tags[:30]))
+        if self.stickers and not images:
+            system_prompt += STICKER_HINT.format(items=self.sticker_list_text())
         messages.append({"role": "system", "content": system_prompt})
         messages.extend(history[-max_history:])
         messages.append({"role": "user", "content": current})
