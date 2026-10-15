@@ -16,6 +16,7 @@ import html
 import json
 import logging
 import mimetypes
+import random
 import re
 import sys
 import time
@@ -29,6 +30,10 @@ import websockets
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.json"
+
+# 本地表情包库:图片放这里,标签写在 tags.json 里
+STICKER_DIR = BASE_DIR / "表情包"
+STICKER_INDEX = STICKER_DIR / "tags.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -113,6 +118,28 @@ def split_ref_marker(text: str) -> tuple[str, str]:
     return body, name
 
 
+# 模型想发表情包时用的标记。标签清单是运行时按表情包库生成再拼进来的。
+STICKER_HINT = (
+    "\n\n【表情包】\n"
+    "情绪到了的时候,可以在回复最后另起一行写:`[STICKER] 标签`,\n"
+    "表示「顺便甩张表情包」。标签只能从这份清单里挑一个:{tags}\n"
+    "大约每三四条回复才发一次,不要连着发,更不要每条都发;\n"
+    "正经回答、算数、查资料这类回复一律不发。觉得不合适就干脆不写。"
+)
+
+
+def split_sticker_marker(text: str) -> tuple[str, str]:
+    """拆出模型附在结尾的 `[STICKER] 标签`,返回(去掉标记的正文, 标签)。"""
+    match = re.search(r"`?\[STICKER\][ \t]*`?([^`\n]*)`?", text)
+    if not match:
+        return text.strip(), ""
+    tag = match.group(1).strip()
+    if tag in {"", "无", "none", "None", "null", "-"}:
+        tag = ""
+    body = (text[: match.start()] + text[match.end():]).strip().strip("`").strip()
+    return body, tag
+
+
 def split_draw_marker(text: str) -> tuple[str, bool]:
     """找出 `[DRAW]` 标记,返回(标记之后的画面描述, 是否要生图)。
 
@@ -169,6 +196,48 @@ class Bot:
         ]
         # 每个会话最近发过的图,供紧接着的追问使用
         self.recent_images: dict[str, tuple[float, list[str]]] = {}
+        # 本地表情包库(读不到就是空的,功能自动隐身)
+        self.stickers, self.sticker_tags = self._load_stickers()
+
+    # ---------- 表情包 ----------
+
+    def _load_stickers(self) -> tuple[list[dict[str, Any]], list[str]]:
+        """读 表情包/tags.json,返回(可用图片列表, 去重后的标签列表)。"""
+        if not STICKER_INDEX.exists():
+            return [], []
+        try:
+            data = json.loads(STICKER_INDEX.read_text("utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("表情包索引读不了(%s): %s", STICKER_INDEX.name, exc)
+            return [], []
+        images = [
+            item
+            for item in (data.get("images") or [])
+            if item.get("file") and (STICKER_DIR / item["file"]).exists()
+        ]
+        tags: list[str] = []
+        for item in images:
+            for tag in item.get("tags") or []:
+                if tag not in tags:
+                    tags.append(tag)
+        if images:
+            log.info("表情包库:%d 张 / %d 个标签", len(images), len(tags))
+        return images, tags
+
+    def pick_sticker(self, tag: str = "") -> Path | None:
+        """按标签挑一张表情包,没标签或没匹配上就随机来一张。"""
+        if not self.stickers:
+            return None
+        pool = self.stickers
+        if tag:
+            hit = [
+                item
+                for item in self.stickers
+                if any(tag in t or t in tag for t in item.get("tags") or [])
+            ]
+            if hit:
+                pool = hit
+        return STICKER_DIR / random.choice(pool)["file"]
 
     # ---------- 域名白名单 ----------
 
@@ -211,6 +280,11 @@ class Bot:
 
     async def reply(self, event: dict[str, Any], text: str) -> None:
         await self.send(event, text)
+
+    async def send_sticker(self, event: dict[str, Any], path: Path) -> None:
+        """把本地表情包当图片发出去。"""
+        b64 = base64.b64encode(path.read_bytes()).decode()
+        await self.send(event, [{"type": "image", "data": {"file": f"base64://{b64}"}}])
 
     # ---------- 消息解析 ----------
 
@@ -330,6 +404,8 @@ class Bot:
         system_prompt = (self.cfg.get("system_prompt") or "") + ROUTING_HINT
         if use_search and not images:
             system_prompt += SEARCH_HINT
+        if self.sticker_tags and not images:
+            system_prompt += STICKER_HINT.format(tags="、".join(self.sticker_tags[:30]))
         messages.append({"role": "system", "content": system_prompt})
         messages.extend(history[-max_history:])
         messages.append({"role": "user", "content": current})
@@ -375,12 +451,13 @@ class Bot:
         history.append(
             {"role": "user", "content": f"{user_text} [图片]".strip() if images else user_text}
         )
-        # [DRAW] / [IMG] 只是给程序看的标记,别原样留在上下文里
+        # [DRAW] / [IMG] / [STICKER] 只是给程序看的标记,别原样留在上下文里
         _, want_draw = split_draw_marker(content)
         if want_draw:
             stored = "[已生成图片]"
         else:
             stored, _ = split_image_marker(content)
+            stored, _ = split_sticker_marker(stored)
         history.append({"role": "assistant", "content": stored})
         # 只保留最近 max_history 条,防止上下文无限增长
         if len(history) > max_history:
@@ -731,6 +808,17 @@ class Bot:
             await self.reply(event, "清了,重新来过")
             return
 
+        # /表情 [标签]:手动要一张表情包
+        if ask_text.startswith("/表情"):
+            tag = ask_text[len("/表情"):].strip()
+            sticker = self.pick_sticker(tag)
+            if sticker:
+                log.info("手动发表情包:%s(%s)", sticker.name, tag or "随机")
+                await self.send_sticker(event, sticker)
+            else:
+                await self.reply(event, "表情包库是空的,往 表情包/ 里丢几张图就有了")
+            return
+
         # 联网搜索:消息以 search_prefix 开头时走支持搜索的模型
         search_prefix = str(self.cfg.get("search_prefix", "/搜"))
         use_search = ask_text.startswith(search_prefix)
@@ -791,7 +879,20 @@ class Bot:
                 answer, img_keyword = split_image_marker(answer)
                 log.info("配图关键词:%s", img_keyword or "(不配图)")
 
-            await self.reply(event, answer)
+            # 情绪到了,模型会在末尾附 [STICKER] 标签,拆出来顺手甩张表情包。
+            # 再抽一次签:模型基本每句都想发,真每条都发就成刷屏了。
+            answer, sticker_tag = split_sticker_marker(answer)
+            sticker = None
+            if sticker_tag and random.random() < float(
+                self.cfg.get("sticker_chance", 0.4)
+            ):
+                sticker = self.pick_sticker(sticker_tag)
+            log.info("表情包:%s(%s)", sticker.name if sticker else "不发", sticker_tag or "-")
+
+            if answer:
+                await self.reply(event, answer)
+            if sticker:
+                await self.send_sticker(event, sticker)
 
             # 联网搜索顺手把相关图片也发过去
             if img_keyword and self.cfg.get("search_images", True):
