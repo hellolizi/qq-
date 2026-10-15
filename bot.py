@@ -715,9 +715,11 @@ class Bot:
         if ask_text is None:
             return
 
-        # 这条没带图,但刚发过图,就把它接上
+        # 这条没带图,但刚发过图,就把它接上。
+        # 用完就丢:不然接下来几分钟里每条消息都拖着这张图,
+        # 模型会一直对着同一张图回答,看起来就像在复读。
         if not images:
-            cached = self.recent_images.get(session_key)
+            cached = self.recent_images.pop(session_key, None)
             if cached and time.time() - cached[0] < float(
                 self.cfg.get("recent_image_seconds", 180)
             ):
@@ -726,7 +728,7 @@ class Bot:
 
         if ask_text in RESET_WORDS:
             self.history[session_key].clear()
-            await self.reply(event, "好的,对话上下文已清空,我们重新开始吧~")
+            await self.reply(event, "清了,重新来过")
             return
 
         # 联网搜索:消息以 search_prefix 开头时走支持搜索的模型
