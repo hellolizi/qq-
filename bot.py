@@ -22,7 +22,8 @@ import random
 import re
 import sys
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -161,6 +162,15 @@ AMBIENT_TPL = (
     "别主动去回这些,也别被带跑题)】\n{chat}\n"
 )
 
+# 成语接龙判定:让模型看真假和接得上接不上,顺手给出下一句
+IDIOM_CHECK_TPL = (
+    "成语接龙。上一个成语是「{last}」,玩家接的是「{word}」。\n"
+    "判断:1) 「{word}」是不是真实存在的四字成语;2) 它的首字是不是「{last}」的尾字"
+    "(同音同字都算);3) 给一个以「{word}」尾字开头、没被用过的常见四字成语当下一句。\n"
+    "只回一行 JSON,不要任何解释:\n"
+    '{{"ok":true,"next":"下一个成语"}} 或 {{"ok":false,"why":"20字内说明为什么不行"}}'
+)
+
 
 def split_find_marker(text: str) -> tuple[str, str]:
     """拆出「去找张现成的图」的 `[FIND] 搜索词`,返回(去掉标记的正文, 搜索词)。"""
@@ -222,6 +232,190 @@ BROWSER_UA = (
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
 
+# ---------- 群功能用到的常量 ----------
+
+DATA_FILE = BASE_DIR / "data.json"  # 积分 / 签到 / 提醒的小存档
+
+# 天气(open-meteo,免费不用 key)和热搜(百度官方)
+GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
+WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+HOT_URL = "https://top.baidu.com/api/board?platform=wise&tab=realtime"
+
+# WMO 天气代码 -> 中文
+WMO_CODE = {
+    0: "晴", 1: "晴间多云", 2: "多云", 3: "阴",
+    45: "雾", 48: "雾凇",
+    51: "小毛毛雨", 53: "毛毛雨", 55: "大毛毛雨",
+    56: "冻毛毛雨", 57: "强冻毛毛雨",
+    61: "小雨", 63: "中雨", 65: "大雨",
+    66: "冻雨", 67: "强冻雨",
+    71: "小雪", 73: "中雪", 75: "大雪", 77: "雪粒",
+    80: "阵雨", 81: "强阵雨", 82: "暴雨",
+    85: "阵雪", 86: "强阵雪",
+    95: "雷阵雨", 96: "雷阵雨伴冰雹", 99: "强雷暴伴冰雹",
+}
+
+DICE_RE = re.compile(r"^(\d{0,3})[dD](\d{1,4})$")
+DURATION_RE = re.compile(r"(\d+)\s*(秒|分钟|分|小时|钟头|时|天)")
+CLOCK_RE = re.compile(r"(?:今天|明天)?\s*(\d{1,2})\s*[:：点]\s*(\d{1,2})?\s*分?")
+DURATION_UNITS = {"秒": 1, "分": 60, "分钟": 60, "时": 3600, "小时": 3600, "钟头": 3600, "天": 86400}
+
+FORTUNE_GOOD = [
+    "摸鱼", "白饭加大份", "DeepSleep 补觉", "跟朋友唠嗑", "买杯奶茶",
+    "把活往后挪", "听歌", "出门吹风", "换头像", "偷吃老板的 token",
+]
+FORTUNE_BAD = [
+    "加班", "早八", "跟老板对线", "通宵打游戏", "点外卖踩雷",
+    "改需求", "跟人争辩", "熬夜刷手机", "冲动购物", "算错数",
+]
+FORTUNE_QUIP = [
+    "别问我准不准,我只负责吃白饭",
+    "信不信随你,反正我信了",
+    "抽到差的也别哭,鲸鲸今天也一般",
+    "算完了,该去吃饭了",
+    "转发给三个群能转运(不能)",
+]
+LUCKY_COLORS = ["深蓝", "奶白", "雾霾蓝", "米黄", "薄荷绿", "藕粉", "银灰", "赤红"]
+
+# 成语接龙的开局成语,后面接不上就让模型续
+IDIOM_SEED = [
+    "一鸣惊人", "风和日丽", "心花怒放", "万事如意", "马到成功",
+    "日新月异", "后来居上", "画蛇添足", "井底之蛙", "守株待兔",
+]
+
+HELP_TEXT = (
+    "小鲸鱼会这些:\n"
+    "/骰 2d6    掷骰子\n"
+    "/抽签      抽一支签\n"
+    "/运势      今日运势\n"
+    "/签到      每天领积分\n"
+    "/积分      看自己积分\n"
+    "/排行榜    群里积分榜\n"
+    "/猜数字    玩猜数字(/猜 50)\n"
+    "/成语接龙  玩成语接龙(/结束 退出)\n"
+    "/提醒 20分钟后 开会   到点提醒你\n"
+    "/提醒列表 /取消提醒 编号\n"
+    "/天气 杭州  看天气\n"
+    "/热搜      百度实时热搜\n"
+    "/表情 [标签]  来张表情包\n"
+    "/画 描述   让鲸鲸画一张\n"
+    "/搜 问题   联网查\n"
+    "/重置      清空对话记忆\n"
+    "群里 @ 我 或直接聊天也行"
+)
+
+COMMANDS = {
+    "帮助", "help", "菜单", "骰", "骰子", "抽签", "运势", "签到", "打卡", "积分",
+    "排行榜", "榜", "猜数字", "猜", "成语接龙", "接龙", "结束", "提醒", "提醒列表",
+    "取消提醒", "天气", "热搜", "禁言", "解除禁言", "全体禁言", "踢", "踢人",
+}
+# 这些不用 @ 机器人也能直接触发(画图/搜索/重置沿用原来的处理)
+BYPASS_COMMANDS = COMMANDS | {"画", "搜", "表情", "重置"}
+
+# 不带 / 也能用的命令(比如直接说"签到")
+KEYWORDS = {
+    "签到": "/签到", "打卡": "/签到", "运势": "/运势", "抽签": "/抽签",
+    "热搜": "/热搜", "帮助": "/帮助", "菜单": "/帮助",
+}
+
+
+def strip_when(text: str) -> str:
+    """干掉时间后面剩下的「后 / 之后 / 以内」这类尾巴。"""
+    return re.sub(r"^[后之以内]{1,2}\s*", "", text.strip(" ,,、")).strip(" ,,、")
+
+
+def parse_duration(text: str) -> tuple[int, str, str]:
+    """解析「20分钟后 开会」这类提醒。返回(秒数, 提醒内容, 出错说明)。"""
+    now = datetime.now()
+    m = DURATION_RE.search(text)
+    if m:
+        seconds = int(m.group(1)) * DURATION_UNITS.get(m.group(2), 60)
+        if seconds <= 0:
+            return 0, "", "时间得是正数"
+        if seconds > 30 * 86400:
+            return 0, "", "最多提醒 30 天内的事"
+        return seconds, strip_when(text[: m.start()] + text[m.end():]), ""
+    m = CLOCK_RE.search(text)
+    if m:
+        hour, minute = int(m.group(1)), int(m.group(2) or 0)
+        if hour > 23 or minute > 59:
+            return 0, "", "这个时间点看不懂"
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if "明天" in m.group(0) or target <= now:
+            target += timedelta(days=1)
+        return (
+            int((target - now).total_seconds()),
+            strip_when(text[: m.start()] + text[m.end():]),
+            "",
+        )
+    return 0, "", "要写成「20分钟后 要干嘛」或者「9:30 要干嘛」"
+
+
+def roll_dice(spec: str) -> str:
+    """掷骰子,支持 2d6 / d20 / 3d100。"""
+    m = DICE_RE.match(spec.strip() or "1d6")
+    if not m:
+        return "格式是 /骰 2d6(个数d面数),比如 /骰 2d6、/骰 d20"
+    count = int(m.group(1) or 1)
+    faces = int(m.group(2))
+    if not 1 <= count <= 10:
+        return "一次最多 10 个骰子"
+    if not 2 <= faces <= 10000:
+        return "骰子面数得在 2 到 10000 之间"
+    rolls = [random.randint(1, faces) for _ in range(count)]
+    if count == 1:
+        return f"🎲 掷出 {rolls[0]}(1-{faces})"
+    return f"🎲 {count}d{faces}:{'+'.join(map(str, rolls))} = {sum(rolls)}"
+
+
+class Store:
+    """很小的本地存档:积分 / 签到 / 提醒。坏了就当空的,不能让机器人起不来。"""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        try:
+            self.data = json.loads(path.read_text("utf-8"))
+            if not isinstance(self.data, dict):
+                raise ValueError
+        except Exception:  # noqa: BLE001
+            self.data = {}
+        self.data.setdefault("points", {})
+        self.data.setdefault("reminders", [])
+
+    def save(self) -> None:
+        try:
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            tmp.replace(self.path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("存档写不进去:%s", exc)
+
+    # --- 积分 ---
+    def points(self, user_id: str) -> dict[str, Any]:
+        rec = self.data["points"].setdefault(
+            user_id, {"score": 0, "total": 0, "days": 0, "last": "", "name": ""}
+        )
+        return rec
+
+    def add_points(self, user_id: str, amount: int, name: str = "") -> dict[str, Any]:
+        rec = self.points(user_id)
+        rec["score"] = max(0, int(rec.get("score", 0)) + amount)
+        if amount > 0:
+            rec["total"] = int(rec.get("total", 0)) + amount
+        if name:
+            rec["name"] = name
+        return rec
+
+    def ranking(self, top: int = 10) -> list[tuple[str, dict[str, Any]]]:
+        items = sorted(
+            self.data["points"].items(),
+            key=lambda kv: int(kv[1].get("total", 0)),
+            reverse=True,
+        )
+        return items[:top]
+
 
 def load_config() -> dict[str, Any]:
     if not CONFIG_PATH.exists():
@@ -254,6 +448,17 @@ class Bot:
         self.last_msg_at = time.time()
         # 群里没点它的话,也顺手记下来当背景,不然它不知道群里在聊什么
         self.ambient: dict[str, list[str]] = defaultdict(list)
+        # 群功能:积分和提醒存本地,游戏状态和防撤回缓存只在内存
+        self.store = Store(DATA_FILE)
+        self.games: dict[str, dict[str, Any]] = {}
+        self.recall_cache: deque[tuple[str, str, str, str]] = deque(
+            maxlen=int(cfg.get("recall_cache", 300))
+        )
+        # 复读接梗:记每个会话最后一句和它连着出现了几次
+        self.said: dict[str, tuple[str, int]] = {}
+        self.repeated: set[str] = set()
+        # call_api_wait 等回包用
+        self.pending: dict[str, asyncio.Future] = {}
 
     # ---------- 表情包 ----------
 
@@ -367,6 +572,35 @@ class Bot:
             await self.ws.send(json.dumps(payload, ensure_ascii=False))
         except Exception as exc:  # noqa: BLE001
             log.warning("调用 %s 失败: %s", action, exc)
+
+    async def call_api_wait(
+        self, action: str, params: dict[str, Any], timeout: float = 8
+    ) -> dict[str, Any]:
+        """调用接口并等回包(查群成员身份、发消息拿 message_id 时要用)。"""
+        if self.ws is None:
+            return {}
+        echo = f"{action}-{random.randint(10**6, 10**7)}"
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self.pending[echo] = future
+        try:
+            await self.ws.send(
+                json.dumps({"action": action, "params": params, "echo": echo}, ensure_ascii=False)
+            )
+            return await asyncio.wait_for(future, timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("调用 %s 没等到回包:%s", action, exc)
+            return {}
+        finally:
+            self.pending.pop(echo, None)
+
+    async def member_role(self, group_id: Any, user_id: Any) -> str:
+        """查这个人在群里的身份:owner / admin / member;查不到返回空串。"""
+        resp = await self.call_api_wait(
+            "get_group_member_info",
+            {"group_id": group_id, "user_id": user_id, "no_cache": False},
+        )
+        data = resp.get("data") if isinstance(resp, dict) else None
+        return str((data or {}).get("role") or "")
 
     async def send(self, event: dict[str, Any], message: Any) -> None:
         """发送消息。message 可以是纯文本,也可以是 OneBot 消息段列表。"""
@@ -574,6 +808,29 @@ class Bot:
         if len(history) > max_history:
             del history[:-max_history]
         return content
+
+    async def ask_plain(self, prompt: str, max_tokens: int = 80) -> str:
+        """问模型一句话,不进对话历史(小游戏判定这种用完就丢的场合用)。"""
+        url = self.cfg.get("deepseek_base_url", "https://api.deepseek.com").rstrip("/")
+        payload = {
+            "model": self.cfg.get("model", "qwen-flash"),
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "enable_thinking": False,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.cfg['deepseek_api_key']}",
+            "Content-Type": "application/json",
+        }
+        try:
+            resp = await self.http.post(url + "/chat/completions", json=payload, headers=headers)
+            if resp.status_code != 200:
+                log.warning("小模型调用返回 %s", resp.status_code)
+                return ""
+            return (resp.json()["choices"][0]["message"].get("content") or "").strip()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("小模型调用失败:%s", exc)
+            return ""
 
     # ---------- 生图 ----------
 
@@ -909,10 +1166,45 @@ class Bot:
         if images:
             self.recent_images[session_key] = (time.time(), images)
 
-        ask_text = self.should_reply(event, text, at_bot, bool(images))
+        # 防撤回:先把这条原文记下来,因为撤回事件里只有一个 message_id
+        if is_group and text:
+            self.recall_cache.append(
+                (
+                    str(event.get("group_id")),
+                    str(event.get("message_id") or ""),
+                    speaker or "某人",
+                    text[:200],
+                )
+            )
+
+        # 命令不用 @ 机器人也能用;成语接龙进行中,直接发四个字也算接龙
+        playing_idiom = self.games.get(session_key, {}).get("kind") == "idiom"
+        looks_idiom = bool(re.fullmatch(r"[\u4e00-\u9fff]{4}", text.strip()))
+        if (self.cfg.get("commands_anyone", True) and self.is_command(text)) or (
+            playing_idiom and looks_idiom
+        ):
+            ask_text = text.strip()
+        else:
+            ask_text = self.should_reply(event, text, at_bot, bool(images))
+
         if ask_text is None:
-            # 没点它的话也听着:不然它只知道被问的那几句,压根不知道群里在聊啥
+            # 没点它的话也听着,顺带该复读就复读
             self.remember_ambient(session_key, speaker, text, bool(images))
+            await self.maybe_repeat(event, session_key, text, is_group)
+            return
+
+        # 成语接龙:接的这一句不走聊天,直接判定
+        if playing_idiom and re.fullmatch(r"[\u4e00-\u9fff]{4}", ask_text):
+            await self.reply(
+                event,
+                await self.answer_idiom(
+                    session_key, str(event.get("user_id") or ""), speaker, ask_text
+                ),
+            )
+            return
+
+        # 斜杠命令 / 关键词命令
+        if await self.handle_command(event, ask_text, session_key, is_group, speaker):
             return
 
         # 这条没带图,但刚发过图,就把它接上。
@@ -1036,6 +1328,480 @@ class Bot:
             if img_keyword and self.cfg.get("search_images", True):
                 await self.send_search_images(event, img_keyword)
 
+    # ---------- 群里的功能命令 ----------
+
+    def is_command(self, text: str) -> bool:
+        """这句要不要当命令处理(命令不用 @ 机器人)。"""
+        t = text.strip()
+        if not t:
+            return False
+        head = t.split(maxsplit=1)[0]
+        return (head[1:] if head.startswith("/") else t) in BYPASS_COMMANDS
+
+    def parse_at_targets(self, event: dict[str, Any]) -> list[str]:
+        """这条消息 @ 了谁(不含机器人自己)。"""
+        out = []
+        for seg in event.get("message") or []:
+            if isinstance(seg, dict) and seg.get("type") == "at":
+                qq = str((seg.get("data") or {}).get("qq") or "")
+                if qq and qq != self.self_id:
+                    out.append(qq)
+        return out
+
+    def target_event(self, event: dict[str, Any], user_id: Any = None) -> dict[str, Any]:
+        """通知类事件没有 message_type,转成能用来发消息的事件。"""
+        if event.get("group_id"):
+            return {"message_type": "group", "group_id": event["group_id"]}
+        return {"message_type": "private", "user_id": user_id or event.get("user_id")}
+
+    # --- 小玩意们 ---
+
+    def make_fortune(self, kind: str) -> str:
+        """运势 / 抽签,本地随机,不花 token。"""
+        good = random.sample(FORTUNE_GOOD, 2)
+        bad = random.sample(FORTUNE_BAD, 2)
+        quip = random.choice(FORTUNE_QUIP)
+        if kind == "抽签":
+            level = random.choices(["上上签", "上签", "中签", "下签"], [1, 3, 4, 2])[0]
+            return f"🎋 {level}\n宜:{good[0]}、{good[1]}\n忌:{bad[0]}、{bad[1]}\n{quip}"
+        stars = random.randint(1, 5)
+        return (
+            f"今日运势 {'★' * stars}{'☆' * (5 - stars)}\n"
+            f"宜:{good[0]}、{good[1]}\n忌:{bad[0]}、{bad[1]}\n"
+            f"幸运数字:{random.randint(0, 99)}  幸运色:{random.choice(LUCKY_COLORS)}\n{quip}"
+        )
+
+    def do_checkin(self, user_id: str, nick: str) -> str:
+        today = datetime.now().strftime("%Y-%m-%d")
+        rec = self.store.points(user_id)
+        if rec.get("last") == today:
+            return f"{nick} 今天已经签过了,明天再来(现在 {rec['score']} 分)"
+        yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        rec["days"] = int(rec.get("days", 0)) + 1 if rec.get("last") == yesterday else 1
+        gain = 10 + min(int(rec["days"]), 7)
+        self.store.add_points(user_id, gain, nick)
+        rec["last"] = today
+        self.store.save()
+        return f"签到成功 +{gain} 分(连续 {rec['days']} 天),现在 {rec['score']} 分"
+
+    def rank_of(self, user_id: str) -> int:
+        for i, (uid, _) in enumerate(self.store.ranking(999), 1):
+            if uid == user_id:
+                return i
+        return 0
+
+    def ranking_text(self) -> str:
+        rows = self.store.ranking(int(self.cfg.get("ranking_size", 10)))
+        if not rows:
+            return "还没人有积分,先 /签到 吧"
+        lines = [
+            f"{i}. {rec.get('name') or uid} {rec.get('total', 0)} 分"
+            for i, (uid, rec) in enumerate(rows, 1)
+        ]
+        return "积分榜:\n" + "\n".join(lines)
+
+    def do_guess(self, session_key: str, user_id: str, nick: str, arg: str) -> str:
+        game = self.games.get(session_key)
+        if not game or game.get("kind") != "number":
+            return "先 /猜数字 开一局吧"
+        if not arg.strip().isdigit():
+            return "猜一个数字,比如 /猜 50"
+        guess = int(arg.strip())
+        game["tries"] = int(game.get("tries", 0)) + 1
+        target = int(game["target"])
+        if guess == target:
+            self.games.pop(session_key, None)
+            self.store.add_points(user_id, 5, nick)
+            self.store.save()
+            return f"中了!就是 {target},{game['tries']} 次猜出来,+5 分"
+        hint = "大了" if guess > target else "小了"
+        return f"{guess} {hint},再猜(第 {game['tries']} 次)"
+
+    def start_idiom(self, session_key: str) -> str:
+        word = random.choice(IDIOM_SEED)
+        self.games[session_key] = {"kind": "idiom", "last": word, "count": 0}
+        return f"成语接龙,我先来:{word}\n接的成语要用「{word[-1]}」开头,直接发四个字就行(/结束 退出)"
+
+    async def answer_idiom(
+        self, session_key: str, user_id: str, nick: str, word: str
+    ) -> str:
+        game = self.games.get(session_key)
+        if not game or game.get("kind") != "idiom":
+            return f"{word} 是成语,不过现在没在玩接龙,想玩就 /成语接龙"
+        last = str(game.get("last") or "")
+        verdict = await self.ask_plain(IDIOM_CHECK_TPL.format(last=last, word=word))
+        data = {}
+        try:
+            start, end = verdict.find("{"), verdict.rfind("}")
+            data = json.loads(verdict[start : end + 1])
+        except Exception:  # noqa: BLE001
+            data = {}
+        if not data.get("ok"):
+            why = str(data.get("why") or "不太对").strip()
+            # 有人乱发四个字也能被当成回答,连错三次就散场,别一直应声
+            game["miss"] = int(game.get("miss", 0)) + 1
+            if game["miss"] >= 3:
+                self.games.pop(session_key, None)
+                return f"{word} 不行:{why}\n连错三次,散了散了,想玩再 /成语接龙"
+            return f"{word} 不行:{why}"
+        game["miss"] = 0
+        nxt = str(data.get("next") or "").strip()
+        game["last"] = nxt or word
+        game["count"] = int(game.get("count", 0)) + 1
+        self.store.add_points(user_id, 2, nick)
+        self.store.save()
+        return f"{nxt or word}(接上第 {game['count']} 个,+2 分)"
+
+    # --- 提醒 ---
+
+    def do_remind(
+        self, event: dict[str, Any], user_id: str, nick: str, rest: str
+    ) -> str:
+        if not rest:
+            return "写法:/提醒 20分钟后 开会"
+        seconds, what, err = parse_duration(rest)
+        if err:
+            return err
+        reminders = self.store.data["reminders"]
+        if len(reminders) >= int(self.cfg.get("reminder_max", 50)):
+            return "提醒太多了,先取消几个"
+        if not what:
+            what = "你让我提醒的事"
+        rid = max((int(r.get("id", 0)) for r in reminders), default=0) + 1
+        reminders.append(
+            {
+                "id": rid,
+                "ts": time.time() + seconds,
+                "group": event.get("group_id"),
+                "user": user_id,
+                "nick": nick,
+                "text": what[:100],
+            }
+        )
+        self.store.save()
+        when = datetime.now() + timedelta(seconds=seconds)
+        return f"好,{when.strftime('%H:%M')} 提醒你「{what}」(编号 {rid})"
+
+    def list_reminders(self, event: dict[str, Any]) -> str:
+        gid = event.get("group_id")
+        mine = [
+            r
+            for r in self.store.data["reminders"]
+            if (gid is None or r.get("group") == gid)
+        ]
+        if not mine:
+            return "这边没有待提醒的事"
+        lines = [
+            f"{r['id']}. {datetime.fromtimestamp(r['ts']).strftime('%m-%d %H:%M')} {r['text']}"
+            for r in mine
+        ]
+        return "待提醒:\n" + "\n".join(lines)
+
+    def cancel_reminder(self, event: dict[str, Any], arg: str) -> str:
+        arg = arg.strip()
+        gid = event.get("group_id")
+        if not arg.isdigit():
+            return "要取消哪个?看 /提醒列表 的编号,比如 /取消提醒 3"
+        rid = int(arg)
+        before = len(self.store.data["reminders"])
+        self.store.data["reminders"] = [
+            r
+            for r in self.store.data["reminders"]
+            if not (
+                int(r.get("id", 0)) == rid
+                and (gid is None or r.get("group") == gid)
+            )
+        ]
+        if len(self.store.data["reminders"]) == before:
+            return f"没找到编号 {rid} 的提醒"
+        self.store.save()
+        return f"取消了 {rid}"
+
+    async def reminder_loop(self) -> None:
+        """到点了就 @ 人提醒。"""
+        while True:
+            await asyncio.sleep(10)
+            now = time.time()
+            due = [r for r in self.store.data["reminders"] if float(r.get("ts", 0)) <= now]
+            if not due:
+                continue
+            self.store.data["reminders"] = [
+                r for r in self.store.data["reminders"] if float(r.get("ts", 0)) > now
+            ]
+            self.store.save()
+            for r in due:
+                target = {"message_type": "group", "group_id": r["group"]} if r.get("group") else {"message_type": "private", "user_id": r["user"]}
+                msg: list[dict[str, Any]] = [
+                    {"type": "at", "data": {"qq": r["user"]}},
+                    {"type": "text", "data": {"text": f" 到点了:{r['text']}"}},
+                ]
+                log.info("提醒 %s:%s", r.get("nick") or r["user"], r["text"])
+                await self.send(target, msg)
+
+    # --- 天气 / 热搜 ---
+
+    async def fetch_weather(self, city: str) -> str:
+        city = (city or str(self.cfg.get("default_city", "北京"))).strip()
+        if not (self.is_safe_url(GEO_URL) and self.is_safe_url(WEATHER_URL)):
+            return "天气接口的域名不在白名单里,先往 config 的 safe_domains 加 open-meteo.com"
+        try:
+            geo = (
+                await self.http.get(
+                    GEO_URL,
+                    params={"name": city, "count": 1, "language": "zh"},
+                    headers={"User-Agent": BROWSER_UA},
+                    timeout=12,
+                )
+            ).json()
+            hit = (geo.get("results") or [None])[0]
+            if not hit:
+                return f"没找到「{city}」这个地方,换个写法试试"
+            w = (
+                await self.http.get(
+                    WEATHER_URL,
+                    params={
+                        "latitude": hit["latitude"],
+                        "longitude": hit["longitude"],
+                        "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m",
+                        "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
+                        "timezone": "auto",
+                        "forecast_days": 1,
+                    },
+                    headers={"User-Agent": BROWSER_UA},
+                    timeout=12,
+                )
+            ).json()
+        except Exception as exc:  # noqa: BLE001
+            return f"天气没查到({exc})"
+        cur = w.get("current") or {}
+        daily = w.get("daily") or {}
+        where = hit.get("name") or city
+        if hit.get("admin1") and hit["admin1"] != where:
+            where = f"{where}({hit['admin1']})"
+        code = cur.get("weather_code")
+        head = (
+            f"{where}现在 {cur.get('temperature_2m')}℃,{WMO_CODE.get(code, '未知')},"
+            f"体感 {cur.get('apparent_temperature')}℃,"
+            f"湿度 {cur.get('relative_humidity_2m')}%,风 {cur.get('wind_speed_10m')}km/h"
+        )
+        low = (daily.get("temperature_2m_min") or ["?"])[0]
+        high = (daily.get("temperature_2m_max") or ["?"])[0]
+        rain = (daily.get("precipitation_probability_max") or ["?"])[0]
+        return f"{head}\n今天 {low}~{high}℃,降水概率 {rain}%"
+
+    async def fetch_hot(self) -> str:
+        if not self.is_safe_url(HOT_URL):
+            return "热搜的域名不在白名单里,先往 config 的 safe_domains 加 top.baidu.com"
+        try:
+            data = (
+                await self.http.get(
+                    HOT_URL, headers={"User-Agent": BROWSER_UA}, timeout=12
+                )
+            ).json()
+        except Exception as exc:  # noqa: BLE001
+            return f"热搜没拉到({exc})"
+        items: list[dict[str, Any]] = []
+        for card in (data.get("data") or {}).get("cards") or []:
+            node = card.get("content")
+            while isinstance(node, list) and node and isinstance(node[0], dict) and "content" in node[0]:
+                node = node[0]["content"]
+            if isinstance(node, list) and node and "word" in node[0]:
+                items = node
+                break
+        if not items:
+            return "热搜今天有点安静,没拉到"
+        count = int(self.cfg.get("hot_count", 10))
+        lines = [
+            f"{i}. {it['word']}"
+            for i, it in enumerate(items[:count], 1)
+            if it.get("word")
+        ]
+        return "百度实时热搜:\n" + "\n".join(lines)
+
+    # --- 群管:禁言 / 踢人 ---
+
+    async def do_admin(
+        self, event: dict[str, Any], head: str, rest: str, is_group: bool
+    ) -> str:
+        if not is_group:
+            return "这个只能在群里用"
+        if not self.cfg.get("admin_cmds", True):
+            return "群管命令没开(config 里 admin_cmds)"
+        group_id = event.get("group_id")
+        user_id = str(event.get("user_id") or "")
+        allowed = user_id in [str(u) for u in (self.cfg.get("admin_users") or [])]
+        if not allowed:
+            allowed = await self.member_role(group_id, user_id) in ("owner", "admin")
+        if not allowed:
+            return "这个只有群管理能用哦"
+        targets = self.parse_at_targets(event)
+
+        if head == "全体禁言":
+            resp = await self.call_api_wait(
+                "set_group_whole_ban", {"group_id": group_id, "enable": True}
+            )
+            return "全员先闭嘴" if resp.get("status") == "ok" else "没弄成,得让我当群管理"
+        if head == "解除禁言":
+            if targets:
+                for t in targets:
+                    await self.call_api_wait(
+                        "set_group_ban", {"group_id": group_id, "user_id": t, "duration": 0}
+                    )
+                return "放出来了"
+            resp = await self.call_api_wait(
+                "set_group_whole_ban", {"group_id": group_id, "enable": False}
+            )
+            return "解除全员禁言" if resp.get("status") == "ok" else "没弄成,得让我当群管理"
+        if not targets:
+            return "要 @ 一个人,比如 /禁言 @某人 10分钟"
+        if head in ("踢", "踢人"):
+            for t in targets:
+                resp = await self.call_api_wait(
+                    "set_group_kick",
+                    {"group_id": group_id, "user_id": t, "reject_add_request": False},
+                )
+                if resp.get("status") != "ok":
+                    return "没踢动,得让我当群管理"
+            return "请出去了"
+        seconds, _, _ = parse_duration(rest)
+        seconds = seconds or int(self.cfg.get("ban_seconds", 600))
+        seconds = min(seconds, 30 * 86400)
+        for t in targets:
+            resp = await self.call_api_wait(
+                "set_group_ban",
+                {"group_id": group_id, "user_id": t, "duration": seconds},
+            )
+            if resp.get("status") != "ok":
+                return "没禁上,得让我当群管理"
+        return f"禁言 {seconds // 60} 分钟"
+
+    async def handle_command(
+        self, event: dict[str, Any], text: str, session_key: str, is_group: bool, speaker: str
+    ) -> bool:
+        """处理命令。返回 True 表示这条已经处理掉了,不用再走聊天。"""
+        raw = text.strip()
+        name = KEYWORDS.get(raw, raw)
+        if name.startswith("/"):
+            name = name[1:]
+        head, _, rest = name.partition(" ")
+        head, rest = head.strip(), rest.strip()
+        if head not in COMMANDS:
+            return False
+        user_id = str(event.get("user_id") or "")
+        nick = speaker or user_id
+
+        if head in ("帮助", "help", "菜单"):
+            extra = (
+                "\n【群管理(得让我当群管理)】\n"
+                "/禁言 @某人 10分钟\n/全体禁言  /解除禁言\n/踢 @某人"
+                if self.cfg.get("admin_cmds", True)
+                else ""
+            )
+            await self.reply(event, HELP_TEXT + extra)
+        elif head in ("骰", "骰子"):
+            await self.reply(event, roll_dice(rest))
+        elif head in ("抽签", "运势"):
+            await self.reply(event, self.make_fortune(head))
+        elif head == "签到":
+            await self.reply(event, self.do_checkin(user_id, nick))
+        elif head == "积分":
+            rec = self.store.points(user_id)
+            await self.reply(
+                event, f"{nick} 有 {rec['score']} 分(总榜第 {self.rank_of(user_id)} 名)"
+            )
+        elif head in ("排行榜", "榜"):
+            await self.reply(event, self.ranking_text())
+        elif head == "猜数字":
+            self.games[session_key] = {
+                "kind": "number",
+                "target": random.randint(1, 100),
+                "tries": 0,
+            }
+            await self.reply(event, "我想好了一个 1-100 的数。/猜 50 这样猜,猜中 +5 分")
+        elif head == "猜":
+            await self.reply(event, self.do_guess(session_key, user_id, nick, rest))
+        elif head == "成语接龙":
+            await self.reply(event, self.start_idiom(session_key))
+        elif head == "接龙":
+            await self.reply(
+                event,
+                await self.answer_idiom(session_key, user_id, nick, rest)
+                if rest
+                else self.start_idiom(session_key),
+            )
+        elif head == "结束":
+            if self.games.pop(session_key, None):
+                await self.reply(event, "不玩了,收工")
+            else:
+                await self.reply(event, "现在没在玩游戏")
+        elif head == "提醒":
+            await self.reply(event, self.do_remind(event, user_id, nick, rest))
+        elif head == "提醒列表":
+            await self.reply(event, self.list_reminders(event))
+        elif head == "取消提醒":
+            await self.reply(event, self.cancel_reminder(event, rest))
+        elif head == "天气":
+            await self.reply(event, await self.fetch_weather(rest))
+        elif head == "热搜":
+            await self.reply(event, await self.fetch_hot())
+        elif head in ("禁言", "解除禁言", "全体禁言", "踢", "踢人"):
+            await self.reply(event, await self.do_admin(event, head, rest, is_group))
+        return True
+
+    async def maybe_repeat(
+        self, event: dict[str, Any], session_key: str, text: str, is_group: bool
+    ) -> None:
+        """群里连着刷同一句话时跟一句。同一句只接一次,不刷屏。"""
+        if not is_group or not self.cfg.get("repeat_enabled", True):
+            return
+        body = text.strip()
+        if not 2 <= len(body) <= 40 or body.startswith("/"):
+            return
+        last, times = self.said.get(session_key, ("", 0))
+        times = times + 1 if body == last else 1
+        self.said[session_key] = (body, times)
+        need = int(self.cfg.get("repeat_min", 3))
+        if times < need or body in self.repeated:
+            return
+        self.repeated.add(body)
+        if len(self.repeated) > 300:
+            self.repeated.clear()
+        if random.random() > float(self.cfg.get("repeat_chance", 0.7)):
+            return
+        log.info("跟着复读一句:%s", body)
+        await self.reply(event, body)
+
+    # ---------- 通知事件 ----------
+
+    async def on_notice(self, event: dict[str, Any]) -> None:
+        """入群欢迎、防撤回。"""
+        ntype = str(event.get("notice_type") or "")
+        if ntype == "group_increase":
+            text = str(self.cfg.get("welcome_text") or "").strip()
+            if not text:
+                return
+            who = str(event.get("user_id") or "")
+            log.info("新人进群:%s", who)
+            await self.send(
+                self.target_event(event),
+                [
+                    {"type": "at", "data": {"qq": who}},
+                    {"type": "text", "data": {"text": f" {text}"}},
+                ],
+            )
+            return
+        if ntype == "group_recall" and self.cfg.get("recall_notice", True):
+            mid = str(event.get("message_id") or "")
+            if not mid:
+                return
+            for _, m_id, who, body in reversed(self.recall_cache):
+                if m_id == mid:
+                    log.info("有人撤回:%s", body[:30])
+                    await self.send(
+                        self.target_event(event), f"「{who}」撤回了一条消息:{body}"
+                    )
+                    return
+
     # ---------- 主循环 ----------
 
     async def watch_stale(self) -> None:
@@ -1059,6 +1825,7 @@ class Bot:
         headers["User-Agent"] = "qq-deepseek-bot/1.0"
 
         asyncio.create_task(self.watch_stale())
+        asyncio.create_task(self.reminder_loop())
         tries = 0
         while True:
             try:
@@ -1082,8 +1849,19 @@ class Bot:
                             data = json.loads(raw)
                         except json.JSONDecodeError:
                             continue
-                        if isinstance(data, dict) and "post_type" in data:
+                        if not isinstance(data, dict):
+                            continue
+                        # 接口回包(call_api_wait 在等),别当事件处理
+                        echo = data.get("echo")
+                        if echo and "post_type" not in data:
+                            future = self.pending.get(echo)
+                            if future and not future.done():
+                                future.set_result(data)
+                            continue
+                        if data.get("post_type") == "message":
                             asyncio.create_task(self.on_event(data))
+                        elif data.get("post_type") == "notice":
+                            asyncio.create_task(self.on_notice(data))
             except Exception as exc:  # noqa: BLE001
                 self.ws = None
                 self.last_msg_at = time.time()

@@ -129,6 +129,22 @@
     "360buyimg.com",
     "jd.com",
     "gov.cn",
-    "baike.com"
-  ]
+    "baike.com",
+    "open-meteo.com",
+    "top.baidu.com"
+  ],
+  "default_city": "杭州",
+  "hot_count": 10,
+  "ranking_size": 10,
+  "reminder_max": 50,
+  "ban_seconds": 600,
+  "recall_cache": 300,
+  "commands_anyone": true,
+  "welcome_text": "欢迎新鱼片~群里没啥规矩,别发广告就行",
+  "recall_notice": true,
+  "repeat_enabled": true,
+  "repeat_min": 3,
+  "repeat_chance": 0.7,
+  "admin_cmds": true,
+  "admin_users": []
 }
