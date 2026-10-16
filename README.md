@@ -34,9 +34,9 @@ QQ
 
 - `bot.py` —— 全部逻辑，就这一个文件
 - `config.example.json` —— 配置模板，复制一份改名叫 `config.json` 再填
-- `requirements.txt` —— 依赖，只有两个
-- `启动.bat` —— 一键拉起 NapCat + 二维码监听 + 机器人
-- `二维码.bat` / `watch_qr.ps1` —— 单独跑二维码监听，有新码就覆盖存成 `二维码.png`
+- `requirements.txt` —— 依赖（websockets / httpx / Pillow）
+- `启动.bat` —— 一键拉起 NapCat + 在窗口里画二维码 + 机器人
+- `二维码.py` —— 把 NapCat 的登录码画在终端里，手机对着屏幕扫；`二维码.bat` 是它的外壳
 - `表情包/` —— 表情包库，图放在这一层，标签写在 `tags.json` 里
 - `NapCat/` —— 别人写的程序，得自己去下，没放进仓库
 

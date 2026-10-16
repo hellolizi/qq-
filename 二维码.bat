@@ -1,16 +1,16 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-title 二维码监听 - 请勿关闭本窗口
+title 二维码 - 用手机扫这个窗口
 
 echo ============================================
-echo   监听 NapCat 登录二维码
-echo   有新码就存成 二维码.png(覆盖上一张)
+echo   盯着 NapCat 的登录码,一出码就画在这个窗口
+echo   手机 QQ 对着屏幕扫;按 Ctrl+C 退出
 echo ============================================
 echo.
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0watch_qr.ps1"
+python "%~dp0二维码.py" --watch
 
 echo.
-echo 监听已停止。按任意键关闭。
+echo 已停止。按任意键关闭。
 pause >nul
