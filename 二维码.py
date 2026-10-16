@@ -9,7 +9,9 @@
 """
 
 import argparse
+import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -36,8 +38,8 @@ def candidates() -> list[Path]:
     return [p for p in files if time.time() - p.stat().st_mtime < FRESH_SECONDS]
 
 
-def pick(files: list[Path]) -> Image.Image | None:
-    """挑最新那批里最大的一张,并确认它是张像样的二维码。"""
+def pick(files: list[Path]) -> tuple[Image.Image, Path] | None:
+    """挑最新那批里最大的一张,并确认它是张像样的二维码。返回(图片, 源文件)。"""
     if not files:
         return None
     newest = max(files, key=lambda p: p.stat().st_mtime)
@@ -51,9 +53,10 @@ def pick(files: list[Path]) -> Image.Image | None:
         except Exception:
             continue
         if img.width >= MIN_PIXELS:
+            img = img.convert("L")
             if path != DST:
                 img.save(DST)  # 顺手覆盖存一份,方便手动扫
-            return img.convert("L")
+            return img, path
     return None
 
 
@@ -168,7 +171,7 @@ def paint(text: str, newline: bool = True) -> None:
     sys.stdout.flush()
 
 
-def draw(img: Image.Image, header: str = "") -> str:
+def draw(img: Image.Image, header: str = "", clear: bool = False) -> str:
     """把码画出来,返回画法:term(宽裕,能放大) / compact(塞满窗口) / window(放不下弹图片)。"""
     fit_console(120, 70)
     cols, lines = term_size()
@@ -176,6 +179,10 @@ def draw(img: Image.Image, header: str = "") -> str:
     modules = module_count(img)
     qr_lines = modules // 2 + modules % 2   # 码本身占几行
     need_cols = modules + QUIET * 2
+
+    if clear:
+        sys.stdout.write("\x1b[2J\x1b[H")   # 换新码时先把旧码擦掉,别两张叠在一起
+        sys.stdout.flush()
 
     if cols < need_cols or lines < qr_lines:
         return fallback(
@@ -199,11 +206,25 @@ def draw(img: Image.Image, header: str = "") -> str:
     return "compact"
 
 
-def pause(prompt: str) -> None:
+def oneshot_target() -> tuple[str, int]:
+    """从 config.json 里读 OneBot 的地址:登录成功后这个端口才会开。"""
     try:
-        input(prompt)
-    except (EOFError, KeyboardInterrupt):
-        print()
+        cfg = json.loads((ROOT / "config.json").read_text("utf-8"))
+        url = str(cfg.get("onebot_ws_url") or "ws://127.0.0.1:3001")
+        host, _, port = url.split("//")[-1].partition(":")
+        return host or "127.0.0.1", int(port or 3001)
+    except Exception:
+        return "127.0.0.1", 3001
+
+
+def logged_in() -> bool:
+    """OneBot 的端口能连上,就说明 QQ 已经登进去了。"""
+    host, port = oneshot_target()
+    try:
+        with socket.create_connection((host, port), timeout=0.6):
+            return True
+    except OSError:
+        return False
 
 
 def main() -> int:
@@ -220,22 +241,39 @@ def main() -> int:
         return 0
 
     deadline = time.time() + args.wait
-    last, shown = "", False
-    while True:
-        files = candidates()
-        newest = max(files, key=lambda p: p.stat().st_mtime, default=None)
-        stamp = f"{newest}:{newest.stat().st_mtime}" if newest else ""
+    last, shown, first = "", False, True
+    hint_printed = False
 
-        if newest and stamp != last:
-            img = pick(files)
-            if img:
+    if logged_in():
+        print("\nQQ 已经登录过了,不用扫码,直接启动机器人。")
+        return 0
+
+    while True:
+        if logged_in():
+            if shown:
+                print("\n登录成功,继续启动。")
+            return 0
+
+        files = candidates()
+        picked = pick(files)
+        if picked:
+            img, source = picked
+            # 时间戳只认源文件:我们自己存的那份是复制品,拿它当依据会一直自我触发重画
+            stamp = f"{source}:{source.stat().st_mtime}"
+            if stamp != last:
                 last, shown = stamp, True
-                mode = draw(img, "\n请用手机 QQ 扫下面的码登录:")
-                if not args.watch:
-                    # 紧凑模式下窗口被塞满了,多印一个字就会把码顶掉,所以什么都不印
-                    pause("" if mode == "compact" else "\n扫码完成后按回车继续…")
-                    return 0
-                deadline = time.time() + args.wait
+                mode = draw(
+                    img,
+                    "\n请用手机 QQ 扫下面的码登录:"
+                    if first
+                    else "\n这张码刷新了(旧的一张超过 1 分钟会失效),请扫这张新的:",
+                    clear=not first,
+                )
+                if not args.watch and mode != "compact" and not hint_printed:
+                    print("\n扫完不用按键;码过期我会自动换新的。")
+                    hint_printed = True
+                deadline = time.time() + args.wait  # 出了新码就重新计时
+                first = False
 
         if not args.watch and time.time() >= deadline:
             break

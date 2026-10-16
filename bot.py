@@ -12,10 +12,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import ctypes
 import html
 import json
 import logging
 import mimetypes
+import os
 import random
 import re
 import sys
@@ -33,6 +35,8 @@ CONFIG_PATH = BASE_DIR / "config.json"
 
 # 本地表情包库:图片放这里,标签写在 tags.json 里
 STICKER_DIR = BASE_DIR / "表情包"
+# 记着当前在跑的实例 pid,防止双击两次启动脚本冒出两个机器人
+LOCK_FILE = BASE_DIR / "bot.lock"
 STICKER_INDEX = STICKER_DIR / "tags.json"
 
 logging.basicConfig(
@@ -1034,15 +1038,46 @@ async def check_api(cfg: dict[str, Any]) -> None:
         print(f"API 异常 {resp.status_code}:", resp.text[:300])
 
 
+def pid_alive(pid: int) -> bool:
+    """这个 pid 还活着吗(只管有没有,不碰它)。"""
+    try:
+        handle = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if not handle:
+            return False
+        ctypes.windll.kernel32.CloseHandle(handle)
+        return True
+    except Exception:
+        return False
+
+
+def other_instance() -> int | None:
+    """已经有另一个小鲸鱼在跑就返回它的 pid。
+
+    不然两个实例同时接 OneBot,群里一句话会被回两遍。
+    """
+    try:
+        pid = int(LOCK_FILE.read_text("utf-8").strip())
+    except Exception:
+        return None
+    return pid if pid != os.getpid() and pid_alive(pid) else None
+
+
 def main() -> None:
     cfg = load_config()
     if "--check" in sys.argv:
         asyncio.run(check_api(cfg))
         return
+    running = other_instance()
+    if running is not None:
+        log.error("已经有一个小鲸鱼在跑了(PID %d),这次就不启动了,免得群里一句话回两遍", running)
+        return
+    LOCK_FILE.write_text(str(os.getpid()), "utf-8")
     try:
         asyncio.run(Bot(cfg).run())
     except KeyboardInterrupt:
         log.info("已退出")
+    finally:
+        LOCK_FILE.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":

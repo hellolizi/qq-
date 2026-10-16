@@ -20,7 +20,7 @@ if defined RUNNING (
 
 echo.
 echo [2/3] 二维码会直接画在这个窗口里,手机 QQ 对着屏幕扫就行。
-echo       不用去开文件夹,也不要点别的窗口;扫完在这个窗口按回车继续。
+echo       不用去开文件夹;扫完也不用按键,登录成功会自动往下走。
 echo.
 python "%~dp0二维码.py" --wait 120
 

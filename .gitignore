@@ -9,6 +9,7 @@ __pycache__/
 *.pyc
 *.log
 二维码.png
+bot.lock
 
 # 本地测试用的对比图
 _compare/
