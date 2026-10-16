@@ -76,10 +76,9 @@
 "chat_thinking": false
 ```
 
-`chat_api_key` 填了，**只有文字聊天**（包括日报、冒泡这些小调用）走这个端点。**联网搜索留在原端点，
-但模型也换成 DeepSeek**——百炼的 `deepseek-v4-pro` 认 `enable_search`，实测能搜到实时内容；
-官网那边不行（往里传 `tools: web_search` 直接被 422 拒掉，它只认 `function` 类型）。
-**识图和生图留在原端点**：DeepSeek 没有能用的看图模型，也不生成图。
+`chat_api_key` 填了，**只有文字聊天**（包括日报、冒泡这些小调用）走这个端点；识图、联网搜索、
+生图都留在原端点。搜索试过换成百炼的 DeepSeek——它认 `enable_search`、实测也搜得到，但那是
+pro 档，按量计价比 flash 贵，所以搜索还是用回 `qwen3.8-flash`。
 
 几个容易踩的点：
 
@@ -88,8 +87,9 @@
 - 官网只认 `deepseek-flash`（1 元/2 元）和 `deepseek-v4-pro`（3 元/6 元），
   老名字 `deepseek-chat` / `deepseek-reasoner` 已经弃用（价格是每百万 tokens，输入/输出）。
 - 官网不认百炼那套 `enable_thinking` / `enable_search`，所以走官网时这两个参数不会发出去。
-- **百炼的 DeepSeek 默认也开着思考**，搜索和扩写这两条路上必须显式 `enable_thinking: false`，
-  不然 `max_tokens` 会被思考烧光、正文变成空字符串（空回复的坑就在这）。
+  往官网传 `tools: web_search` 会被 **422** 拒掉（它只认 `function` 类型），所以官网搜不了。
+- **百炼的 DeepSeek 默认也开着思考**，要是哪天把搜索模型换成 `deepseek-*`，那条路必须显式
+  `enable_thinking: false`，不然 `max_tokens` 会被思考烧光、正文变成空字符串（这坑踩过）。
 - 搜索的答案是把资料揉进去讲，比闲聊长，所以搜索时不受 `reply_max_tokens` 那个 120 的限长，
   改用 `max_tokens`，不然会拦腰断在半句。
 - `chat_api_key` 留空 = 一切照旧，等于没配。想切回来把 key 清掉就行。
@@ -148,10 +148,10 @@ QQ
 - `onebot_ws_url` —— NapCat 的地址
 - `deepseek_base_url` / `deepseek_api_key` —— 模型服务和 Key，OpenAI 兼容的都能用
 - `model` —— 百炼那边的兜底聊天模型（`chat_api_key` 没填时就靠它）
-- `vision_model` —— 看图的模型（DeepSeek 没这类，留通义）
-- `search_model` —— 联网用的（用百炼的 DeepSeek，因为只有它这么配才认 `enable_search`）
-- `image_model` —— 画图用的（DeepSeek 不生成图，留通义）
-- `draw_prompt_model` —— 画图前扩写描述、顺便核对角色长相的（纯文字活，用 DeepSeek）
+- `vision_model` —— 看图的模型
+- `search_model` —— 联网用的（flash 档就够，pro 档搜得到但按量更贵）
+- `image_model` —— 画图用的
+- `draw_prompt_model` —— 画图前扩写描述、顺便核对角色长相的
 - `reply_max_tokens` —— 聊天回复的长度上限（搜索那条路不受这个限制）
 - `max_history` —— 每个会话记多少轮
 - `recent_image_seconds` —— 图片「保鲜期」，过了就不认了
