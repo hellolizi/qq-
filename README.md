@@ -52,10 +52,10 @@
   群里好几个人一起复读同一句（接梗）不算刷屏；群主/管理员/`admin_users` 一律不动；
   一天最多禁 10 个人。阈值都在 `spam_*` 那几个配置里，嫌严就把 `spam_count` 调大。
 - **群统计** —— `/统计` 看今天这个群聊了多少条、谁最活跃、几点最热闹。
-- **余额** —— `/余额` **三个地方都查**：DeepSeek 官网还剩多少钱（问 `/user/balance`）、
-  阿里云账户还剩多少（现金走 `QueryAccountBalance`，优惠券走 `DescribeCoupon`，学生那 300 元就在券里）、
-  百炼那几个模型还剩多少免费 token 额度（`bl usage free`）。都是问官方接口，不是自己估的。
-  哪一段没配 key 就自动不显示，不会报错。
+- **余额** —— `/余额` **两个地方都查**：DeepSeek 官网还剩多少钱（问 `/user/balance`）、
+  阿里云账户还剩多少（现金走 `QueryAccountBalance`，优惠券走 `DescribeCoupon`，学生那 300 元就在券里）。
+  都是问官方接口，不是自己估的。哪一段没配 key 就自动不显示，不会报错。
+  （百炼那几个模型的免费 token 额度不再报了——聊天已经接去官网，那一长串没多大意思。）
 - `aliyun_access_key_id` / `aliyun_access_key_secret` —— 查阿里云现金和那 300 元优惠券要用的 RAM 密钥。
   **注意这是第三套密钥**，跟百炼的、DeepSeek 的都不同。留空 = 不查阿里云这一段。
   建议用子账号、只给 `bss:DescribeCoupons` 和 `bss:QueryAccountBalance` 这两条权限，见下面「怎么用起来」第 8 条。
@@ -120,7 +120,7 @@ pro 档，按量计价比 flash 贵，所以搜索还是用回 `qwen3.8-flash`�
 - `chat_api_key` 留空 = 一切照旧，等于没配。想切回来把 key 清掉就行。
 
 `/余额` 会跟着变：接去官网之后，它会**分两段**报——上面一段是官网余额（按量扣费），
-下面一段才是阿里云那边的免费额度。
+下面一段是阿里云账户的钱（现金 + 那 300 元券）。
 
 ## 怎么跑的
 
@@ -143,7 +143,7 @@ QQ
 - `requirements.txt` —— 依赖（websockets / httpx / Pillow）
 - `启动.bat` —— 一键拉起 NapCat + 在窗口里画二维码 + 机器人
 - `二维码.py` —— 把 NapCat 的登录码画在终端里，手机对着屏幕扫；`二维码.bat` 是它的外壳
-- `登录余额.bat` —— `/余额` 的登录态过期时，双击这个重新授权一次
+- `登录余额.bat` —— 以前 `/余额` 查百炼免费额度时用的重新授权脚本；现在不查额度了，用不上了，留着不碍事
 - `表情包/` —— 表情包库，图放在这一层，标签写在 `tags.json` 里
 - `data.json` —— 积分、签到、待提醒的事，跑起来自己生成（已 gitignore）
 - `memory.json` —— 长期记忆的聊天存档，也自己生成（已 gitignore）
@@ -156,15 +156,10 @@ QQ
 3. 在 NapCat 的 WebUI 里开一个正向 WebSocket，端口跟 `onebot_ws_url` 对上
 4. `copy config.example.json config.json`，把 Key 填上
 5. 双击 `启动.bat`
-6. 想用 `/余额` 查免费额度的话，再装一个阿里云百炼的官方命令行（一次性的事）：
+6. （可选）阿里云账户那段要能查，得在 `aliyun_access_key_id` / `aliyun_access_key_secret` 里填一组有
+   `QueryAccountBalance` + `DescribeCoupons` 权限的 RAM 密钥。不填就只报官网余额，不报错。
 
-   ```
-   irm https://bailian.aliyun.com/cli/install.ps1 | iex
-   bl auth login --console
-   ```
-
-   第二条会开浏览器，登录阿里云账号点一下授权。登录态会过期，过期后 `/余额` 会提醒你，
-   双击 `登录余额.bat` 重新登一次就行。不装也不影响别的功能，`/余额` 会直接说没找到工具。
+   以前 `/余额` 还要装阿里云百炼的命令行（`bl`）来查模型免费额度，现在这块不报了，不用装了。
 
 `config.json` 里有 Key，所以我把它写进 `.gitignore` 了，别手滑传上去。
 

@@ -125,7 +125,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "check_balance",
-            "description": "查这个号还剩多少钱、多少免费额度",
+            "description": "查这个号还剩多少钱(官网余额 + 阿里云现金/券)",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
@@ -176,7 +176,7 @@ TOOLS = [
 # 挂了工具时补一句,让她知道这些能自己办,别嘴上说「我查不了」
 NATURAL_HINT = (
     "\n\n【你自己的本事(需要时直接调工具拿结果,别嘴上说「我查不了」)】\n"
-    "查钱/额度→check_balance;查天气→get_weather;看热搜→get_hot;"
+    "查钱/还剩多少→check_balance;查天气→get_weather;看热搜→get_hot;"
     "看本群今天活跃度→group_stats;要最新或你自己拿不准的事→web_search。\n"
     "拿到结果以后用你自己的口气说一两句,别把原始结果原样复述一遍。\n"
 )
@@ -2411,7 +2411,10 @@ class Bot:
         return head + "\n· 余额 " + " ".join(segs)
 
     async def fetch_aliyun_balance(self) -> str:
-        """跑一次 bl usage free,问阿里云还剩多少额度。"""
+        """跑一次 bl usage free,问阿里云还剩多少额度。
+
+        /余额 现在不展示这一块了(只报官网余额 + 阿里云现金/券),这个留着备用。
+        """
         exe = find_bl()
         if not exe:
             return "【阿里云百炼】\n没找到命令行工具(bl),装上才能查额度"
@@ -2538,13 +2541,12 @@ class Bot:
         return "【阿里云账户 · 学生权益】\n" + "\n".join(lines)
 
     async def fetch_balance(self) -> str:
-        """三处都问一遍:DeepSeek 官网余额 + 阿里云账户(现金+券) + 百炼免费额度。"""
-        ds, coupon, ali = await asyncio.gather(
+        """问两处:DeepSeek 官网余额 + 阿里云账户(现金+券)。"""
+        ds, coupon = await asyncio.gather(
             self.fetch_ds_balance(),
             self.fetch_aliyun_money(),
-            self.fetch_aliyun_balance(),
         )
-        parts = [p for p in (ds, coupon, ali) if p]
+        parts = [p for p in (ds, coupon) if p]
         if not parts:
             return "没查到余额,几个 key 可能都没配上"
         return "鲸鲸的白饭账本:\n\n" + "\n\n".join(parts)
