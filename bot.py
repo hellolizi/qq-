@@ -740,6 +740,8 @@ class Bot:
         self.stats: dict[str, dict[str, Any]] = {}
         self.day_log: dict[str, list[str]] = defaultdict(list)
         self.last_active: dict[str, float] = {}
+        # 没人叫它、它自己插话的时间点,免得连着搭话刷屏
+        self.last_chime: dict[str, float] = {}
         self.reported_day = ""
         self.steal_count: dict[str, Any] = {"day": "", "n": 0}
         self.known_hashes: set[str] = self._hash_stickers()
@@ -952,6 +954,24 @@ class Bot:
                     images.append(ref)
         return "".join(parts).strip(), at_bot, images[:4]
 
+    def bot_names(self) -> list[str]:
+        """别人平时怎么叫它。叫到名字它就得答应。"""
+        names = self.cfg.get("bot_names") or ["小鲸鱼", "小鲸", "鲸鲸"]
+        return [str(n).strip() for n in names if str(n).strip()]
+
+    def mentions_me(self, text: str) -> bool:
+        """这句里点名它了没(没 @ 也算)。"""
+        return any(n in text for n in self.bot_names())
+
+    def in_quiet_hours(self) -> bool:
+        """现在是不是免打扰时段(夜里的 23:00~08:00)。"""
+        hour = datetime.now().hour
+        quiet = self.cfg.get("quiet_hours") or [23, 8]
+        start, end = int(quiet[0]), int(quiet[1])
+        if start > end:
+            return hour >= start or hour < end
+        return start <= hour < end
+
     def should_reply(
         self, event: dict[str, Any], text: str, at_bot: bool, has_images: bool = False
     ) -> str | None:
@@ -960,8 +980,11 @@ class Bot:
         if event.get("message_type") == "private":
             return text if has_content else None
 
-        # 群聊
-        mode = str(self.cfg.get("group_trigger", "at")).lower()
+        # 群聊:@ 了它、或者叫了它的名字,这两种必须回,跟什么触发模式无关
+        if at_bot or self.mentions_me(text):
+            return text if has_content else None
+
+        mode = str(self.cfg.get("group_trigger", "smart")).lower()
         if mode == "all":
             return text if has_content else None
         if mode == "prefix":
@@ -970,8 +993,25 @@ class Bot:
                 return None
             stripped = text[len(prefix):].strip()
             return stripped if (stripped or has_images) else None
-        # 默认: 需要 @机器人
-        return text if (at_bot and has_content) else None
+        if mode == "at":
+            return None
+        # smart:没人叫它也能搭一句,但按概率来,还有冷却和免打扰,免得每条都插嘴
+        if not has_content:
+            return None
+        key = f"group_{event.get('group_id')}"
+        now = time.time()
+        if now - self.last_chime.get(key, 0) < float(self.cfg.get("chime_cooldown", 90)):
+            return None
+        # 上次说完话一直没人接,就别再往上凑了
+        sulk = int(self.cfg.get("sulk_after", 5))
+        if sulk and self.silent_streak.get(key, 0) >= sulk:
+            return None
+        if self.in_quiet_hours():
+            return None
+        if random.random() < float(self.cfg.get("chime_chance", 0.08)):
+            self.last_chime[key] = now
+            return text
+        return None
 
     # ---------- DeepSeek ----------
 
@@ -2577,12 +2617,7 @@ class Bot:
         """冷场时主动说一句。"""
         if not self.cfg.get("proactive", True):
             return
-        hour = datetime.now().hour
-        quiet = self.cfg.get("quiet_hours") or [23, 8]
-        start, end = int(quiet[0]), int(quiet[1])
-        if (start > end and (hour >= start or hour < end)) or (
-            start <= end and start <= hour < end
-        ):
+        if self.in_quiet_hours():
             return
         idle = float(self.cfg.get("proactive_idle_minutes", 45)) * 60
         need = int(self.cfg.get("proactive_min_messages", 6))

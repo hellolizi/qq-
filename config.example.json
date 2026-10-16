@@ -33,8 +33,15 @@
   "recent_image_seconds": 180,
   "ambient_lines": 30,
   "sticker_chance": 0.7,
-  "group_trigger": "at",
+  "group_trigger": "smart",
   "group_prefix": "/ds",
+  "bot_names": [
+    "小鲸鱼",
+    "小鲸",
+    "鲸鲸"
+  ],
+  "chime_chance": 0.08,
+  "chime_cooldown": 90,
   "reply_timeout": 60,
   "safe_domains": [
     "qq.com",

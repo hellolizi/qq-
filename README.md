@@ -38,8 +38,11 @@
   **注意这是第三套密钥**，跟百炼的、DeepSeek 的都不同。留空 = 不查阿里云这一段。
   建议用子账号、只给 `bss:DescribeCoupons` 和 `bss:QueryAccountBalance` 这两条权限，见下面「怎么用起来」第 8 条。
 
-群聊默认要 @ 才理，不然太吵。聊天里的「闲聊」她只听不答（当上下文背景），
-所以她知道群里刚在聊什么，但不会插嘴。
+群聊默认用 `smart` 那档：**@ 她、或者直接叫她的名字（`bot_names` 里那几个），一定会回**；
+没人叫她的时候也有小概率自己搭一句（`chime_chance`，默认 8%），但插过话后有 `chime_cooldown` 秒冷却、
+夜里 `quiet_hours` 不吭声、被冷落够了也不往上凑，所以不会变成刷屏怪。
+想回到「只理 @」的老规矩，就把 `group_trigger` 改成 `at`。
+群里别人没点她的闲聊，她只听不答（当上下文背景），所以她知道群里刚在聊什么。
 
 ### 那些让她「像个群友」的小设计
 
@@ -156,7 +159,10 @@ QQ
 - `max_history` —— 每个会话记多少轮
 - `recent_image_seconds` —— 图片「保鲜期」，过了就不认了
 - `sticker_chance` —— 模型想发表情包时，真正发出去的概率（不然每条都发就刷屏了）
-- `group_trigger` —— `at` / `prefix` / `all`，群里怎么触发
+- `group_trigger` —— `smart`（默认：被叫必回，没人叫也可能搭一句）/ `at`（只理 @ 和点名）/
+  `prefix`（只理带 `group_prefix` 的）/ `all`（每条都回）
+- `bot_names` —— 别人怎么叫它算「点名」。写进去的词一出现就必须回，所以别放太常见的词
+- `chime_chance` / `chime_cooldown` —— 没人叫时插话的概率、两次插话至少隔多少秒
 - `default_city` —— `/天气` 不带城市时用哪个
 - `admin_cmds` / `admin_users` —— 群管命令开关；`admin_users` 里写死几个 QQ 号也能用
 - `welcome_text` / `recall_notice` / `repeat_enabled` —— 入群欢迎语、防撤回、复读接梗的开关
