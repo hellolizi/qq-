@@ -422,6 +422,10 @@ KEYWORDS = {
 # 只认短句,而且要排除「余额宝」「支付宝」这种正常聊天。
 NATURAL_CMDS = (("余额", "余额"), ("额度", "余额"))
 NATURAL_STOP = ("余额宝", "支付宝", "微信", "银行卡")
+# 「把这个人踢了」「踢了他」这种口语也得认,不然没人老实打 /踢 @某人
+KICK_RE = re.compile(r"(?:把|将|给)[^，。!？?\s]{0,12}?[踢Tt]|[踢Tt](?:出去|掉|走|了)")
+# 但在聊踢球的群里,「把球踢飞了」也是这个句式,别误认
+KICK_STOP = ("踢球", "足球", "踢毽", "踢腿", "踢踏", "踢飞", "球踢")
 
 
 def natural_command(text: str) -> str:
@@ -431,6 +435,8 @@ def natural_command(text: str) -> str:
         return ""
     if any(w in body for w in NATURAL_STOP):
         return ""
+    if KICK_RE.search(body) and not any(w in body for w in KICK_STOP):
+        return "踢"
     for kw, cmd in NATURAL_CMDS:
         if kw in body:
             return cmd
@@ -742,6 +748,8 @@ class Bot:
         self.last_active: dict[str, float] = {}
         # 没人叫它、它自己插话的时间点,免得连着搭话刷屏
         self.last_chime: dict[str, float] = {}
+        # 群成员名单的缓存(群号 -> (取的时刻, 名单)),点名踢人时要用
+        self.member_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self.reported_day = ""
         self.steal_count: dict[str, Any] = {"day": "", "n": 0}
         self.known_hashes: set[str] = self._hash_stickers()
@@ -1812,6 +1820,67 @@ class Bot:
                     out.append(qq)
         return out
 
+    async def group_members(self, group_id: Any) -> list[dict[str, Any]]:
+        """群成员名单。缓存 5 分钟,免得点一次人就去拉一遍。"""
+        key = str(group_id)
+        now = time.time()
+        hit = self.member_cache.get(key)
+        if hit and now - hit[0] < 300:
+            return hit[1]
+        resp = await self.call_api_wait("get_group_member_list", {"group_id": group_id})
+        raw = resp.get("data") if isinstance(resp, dict) else None
+        members = [m for m in (raw or []) if isinstance(m, dict)]
+        if members:
+            self.member_cache[key] = (now, members)
+        return members
+
+    async def member_name(self, group_id: Any, user_id: Any) -> str:
+        """这人在群里叫什么(优先群名片,其次昵称)。"""
+        for m in await self.group_members(group_id):
+            if str(m.get("user_id") or "") == str(user_id):
+                return str(m.get("card") or m.get("nickname") or "")
+        return ""
+
+    async def quoted_user(self, event: dict[str, Any]) -> str:
+        """「引用」的那条消息是谁发的。得回问一次 NapCat 才知道。"""
+        for seg in event.get("message") or []:
+            if not isinstance(seg, dict) or seg.get("type") != "reply":
+                continue
+            mid = str((seg.get("data") or {}).get("id") or "")
+            if not mid:
+                continue
+            resp = await self.call_api_wait("get_msg", {"message_id": mid})
+            data = resp.get("data") if isinstance(resp, dict) else None
+            qq = str(((data or {}).get("sender") or {}).get("user_id") or "")
+            if qq and qq != self.self_id:
+                return qq
+        return ""
+
+    async def guess_kick_target(self, event: dict[str, Any], text: str) -> tuple[str, str]:
+        """口语里要踢谁:① @ 的 ② 引用的是谁 ③ 说「我」就是他自己 ④ 名字对得上。
+        返回 (QQ, 名字),猜不出来给两个空串,让调用方去反问。
+        """
+        group_id = event.get("group_id")
+        target = (self.parse_at_targets(event) or [""])[0]
+        if not target:
+            target = await self.quoted_user(event)
+        if not target and re.search(r"我|自己", text):
+            target = str(event.get("user_id") or "")
+        if target:
+            return target, await self.member_name(group_id, target)
+        # 直接把名字打出来了:挑名字最长的那条,一样长(分不清)就不动手
+        hit: list[tuple[int, str, str]] = []
+        for m in await self.group_members(group_id):
+            name = str(m.get("card") or m.get("nickname") or "").strip()
+            if name and name in text:
+                hit.append((len(name), name, str(m.get("user_id") or "")))
+        if not hit:
+            return "", ""
+        hit.sort(reverse=True)
+        if len(hit) > 1 and hit[0][0] == hit[1][0]:
+            return "", ""
+        return hit[0][2], hit[0][1]
+
     def target_event(self, event: dict[str, Any], user_id: Any = None) -> dict[str, Any]:
         """通知类事件没有 message_type,转成能用来发消息的事件。"""
         if event.get("group_id"):
@@ -2344,16 +2413,23 @@ class Bot:
                 "set_group_whole_ban", {"group_id": group_id, "enable": False}
             )
             return "解除全员禁言" if resp.get("status") == "ok" else "没弄成,得让我当群管理"
+        if not targets and head in ("踢", "踢人"):
+            # 没人 @、也没引用,那大概是「把 XX 踢了」这种说法,自己认一下
+            one, _name = await self.guess_kick_target(event, self.parse_message(event)[0])
+            if one:
+                targets = [one]
+            else:
+                return "踢谁?@ 一下、引用他那条消息,或者直接把名字打出来都行"
         if not targets:
             return "要 @ 一个人,比如 /禁言 @某人 10分钟"
-        # 机器人自己顶多是个管理员:管理员之间、管理员对群主,QQ 都不让动,先拦下来
+        # 踢人这动作是「我这个号」发出去的,QQ 只认我自己的身份,不认指使的人
         self_role = await self.member_role(group_id, self.self_id)
         for t in targets:
             role = await self.member_role(group_id, t)
             if role == "owner":
-                return "那是群主,我没资格动"
+                return "那是群主。QQ 不许踢群主,我这号也当不了群主 —— 只能他自己退群,或者先把群主转给别人"
             if role == "admin" and self_role != "owner":
-                return "他也是管理员,跟我平级 —— 管理员之间踢不动也禁不了,只有群主能"
+                return "他也是管理员。踢人的动作是我这个号发的,QQ 不许管理员踢管理员 —— 你自己在群里点一下吧"
         if head in ("踢", "踢人"):
             for t in targets:
                 resp = await self.call_api_wait(
