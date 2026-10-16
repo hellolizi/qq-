@@ -165,5 +165,22 @@
   "steal_max_per_day": 8,
   "daily_report": true,
   "report_time": "21:00",
-  "report_min_messages": 30
+  "report_min_messages": 30,
+  "steal_min_seen": 2,
+  "sulk_after": 5,
+  "reply_max_chars": 300,
+  "empty_at_replies": [
+    "怎么了？",
+    "？",
+    "嗯？",
+    "干啥？"
+  ],
+  "keyword_reactions": {
+    "早上好": "现在是早上,随口打个招呼,一句就够,别太热情",
+    "早安": "现在是早上,随口打个招呼,一句就够",
+    "晚安": "对方要睡了,你简短道个别就行",
+    "生日快乐": "今天对方生日,说句祝福,一句就够",
+    "谢谢": "对方在谢你,随口应一声,别客套",
+    "新年快乐": "过年了,说句吉利的,别写小作文"
+  }
 }

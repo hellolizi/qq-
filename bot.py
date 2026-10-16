@@ -171,6 +171,18 @@ MEMORY_TPL = (
     "跟眼前的话题沾边就自然带一句,不沾边就别硬提,别提「根据我的记忆」这种话。\n"
 )
 
+# 命中关键词时追加一条反应提示(只给方向,别让它照抄这句话)
+REACTION_TPL = (
+    "\n\n【这条消息触发了固定反应,照这个意思回,别把这句话原样抄出来】\n{rule}\n"
+)
+
+# 模型挂了的时候别装死,随口应一声,免得群里觉得「她不理我」
+FAIL_LINES = (
+    "啊,我卡了一下,你再说一遍?",
+    "网卡了,重发一遍…",
+    "刚走神了,你刚才说啥",
+)
+
 # 成语接龙判定:让模型看真假和接得上接不上,顺手给出下一句
 IDIOM_CHECK_TPL = (
     "成语接龙。上一个成语是「{last}」,玩家接的是「{word}」。\n"
@@ -452,6 +464,74 @@ def roll_dice(spec: str) -> str:
     return f"🎲 {count}d{faces}:{'+'.join(map(str, rolls))} = {sum(rolls)}"
 
 
+# 模型爱吐 markdown、bullet、「好的，我帮你看看」这类客服腔。QQ 里 markdown 根本不渲染,
+# 照原样发进群里一眼就露馅,所以出门之前先洗一遍。
+MD_FENCE_RE = re.compile(r"```[a-zA-Z0-9_+-]*\n?")
+MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*", re.S)
+# 单星号包起来的多半是 *叹气* 这种动作;别动 3*4*5 这种正常写法,所以只在动作词上生效
+MD_STAR_ACTION_RE = re.compile(r"(?<!\*)\*([^*\n]{1,12})\*(?!\*)")
+MD_CODE_RE = re.compile(r"`([^`\n]+)`")
+MD_HEAD_RE = re.compile(r"^\s{0,3}#{1,6}\s*", re.M)
+MD_QUOTE_RE = re.compile(r"^\s{0,3}>\s?", re.M)
+MD_BULLET_RE = re.compile(r"^\s{0,3}(?:[-*+•]|\d{1,2}[.、)])\s+", re.M)
+# 「（挠头）」「(笑)」这种动作描写,真人打字不会这么干
+ACTION_RE = re.compile(r"[（(]\s*\*?([^（()）]{0,10})\*?\s*[）)]")
+ACTION_WORDS = (
+    "挠头", "歪头", "叹气", "拍桌", "摊手", "捂脸", "沉思", "眨眼", "叉腰", "鼓脸",
+    "点头", "摇头", "小声", "伸懒腰", "打哈欠", "皱眉", "脸红", "捂嘴", "比心",
+    "吐舌", "撇嘴", "眼神", "假装", "角落", "画圈", "doge", "低头", "抬头",
+)
+# 客服味的开场白和收尾话术,最该砍的就是这两头
+BOT_OPENERS = (
+    "好的，", "好的,", "当然，", "当然,", "明白了，", "明白了,", "没问题，",
+    "以下是我", "作为AI", "作为一个AI", "作为一个人工智能", "我是AI",
+)
+BOT_TAIL_RE = re.compile(
+    r"[，,。！!]?\s*(?:希望(?:以上|这些)?(?:回答|内容|信息)?(?:能)?(?:对你|对您)?"
+    r"(?:有|能)?(?:所)?(?:帮助|帮到你)|还有什么(?:可以|需要)?(?:帮|问)[^。！？]*|"
+    r"有其他问题[^。！？]*|如果你(?:还)?有其他[^。！？]*)[。！？]?"
+)
+PUNCT_RUN_RE = re.compile(r"([，,。！!？?])\1+")
+
+
+def polish_reply(text: str, max_chars: int = 0) -> str:
+    """把模型的回复洗成能直接发进 QQ 群的样子。"""
+    body = (text or "").strip()
+    if not body:
+        return ""
+    # 有代码块就手下留情:长度上限不砍它,缩进也别动
+    has_code = "```" in body or bool(re.search(r"\n\s{4,}\S", body))
+    body = MD_FENCE_RE.sub("", body)
+    body = MD_BOLD_RE.sub(r"\1", body)
+    body = MD_CODE_RE.sub(r"\1", body)
+    body = MD_HEAD_RE.sub("", body)
+    body = MD_QUOTE_RE.sub("", body)
+    body = MD_BULLET_RE.sub("", body)
+
+    def _drop_action(m: re.Match[str]) -> str:
+        inner = (m.group(1) or "").strip().lower()
+        # 只有确实是动作词才删,(如列表) 这种正经括号得留着
+        return "" if inner and any(w in inner for w in ACTION_WORDS) else m.group(0)
+
+    body = ACTION_RE.sub(_drop_action, body)
+    body = MD_STAR_ACTION_RE.sub(_drop_action, body)
+    for opener in BOT_OPENERS:
+        if body.startswith(opener) and len(body) > len(opener) + 1:
+            body = body[len(opener):].lstrip("，,、 ").strip()
+    body = BOT_TAIL_RE.sub("", body)
+    body = PUNCT_RUN_RE.sub(r"\1", body)
+    body = re.sub(r"\n{3,}", "\n\n", body).strip()
+    if body.endswith("!"):
+        body = body[:-1] + "！"
+    elif body.endswith("?"):
+        body = body[:-1] + "？"
+    if max_chars and len(body) > max_chars and not has_code:
+        cut = body[:max_chars]
+        mark = max((cut.rfind(c) for c in "。！？…；"), default=-1)
+        body = cut[: mark + 1] if mark >= max_chars // 2 else cut.rstrip("，,、 ") + "…"
+    return body.strip()
+
+
 class Store:
     """很小的本地存档:积分 / 签到 / 提醒。坏了就当空的,不能让机器人起不来。"""
 
@@ -632,6 +712,13 @@ class Bot:
         self.reported_day = ""
         self.steal_count: dict[str, Any] = {"day": "", "n": 0}
         self.known_hashes: set[str] = self._hash_stickers()
+        # 试收过的图指纹 -> 见过几次。见得够多才认为是真表情包,别把截图也收了
+        self.seen_counts: dict[str, int] = {}
+        # 她说过话之后,群里连着多少条没人理她(数够了就先闭嘴)
+        self.silent_streak: dict[str, int] = {}
+        self.said_at: dict[str, float] = {}
+        # 本条消息命中的关键词反应,用完就丢
+        self.reaction: dict[str, str] = {}
 
     def _hash_stickers(self) -> set[str]:
         """给库里已有的表情包算指纹,免得偷回来一堆重复的。"""
@@ -938,6 +1025,10 @@ class Bot:
         )
         if recalled:
             system_prompt += MEMORY_TPL.format(items="\n".join(recalled))
+        # 早上好 / 晚安 / 生日快乐 这类,给一句方向就行,话由她自己说
+        rule = self.reaction.pop(session_key, "")
+        if rule:
+            system_prompt += REACTION_TPL.format(rule=rule)
         messages.append({"role": "system", "content": system_prompt})
         messages.extend(history[-max_history:])
         messages.append({"role": "user", "content": current})
@@ -1365,6 +1456,15 @@ class Bot:
             if is_group:
                 asyncio.create_task(self.steal_stickers(images, event))
 
+        # 冷落计数:没点她、而她又刚说过话,就算一条「没人接」;点了她就归零
+        if is_group:
+            if at_bot:
+                self.silent_streak[session_key] = 0
+            elif text and self.said_at.get(session_key) and (
+                time.time() - self.said_at[session_key] < 1800
+            ):
+                self.silent_streak[session_key] = self.silent_streak.get(session_key, 0) + 1
+
         # 防撤回:先把这条原文记下来,因为撤回事件里只有一个 message_id
         if is_group and text:
             self.recall_cache.append(
@@ -1389,10 +1489,24 @@ class Bot:
             ask_text = self.should_reply(event, text, at_bot, bool(images))
 
         if ask_text is None:
+            # 只 @ 了一下、什么都没说:别装没看见,随口应一声
+            if is_group and at_bot and not text.strip() and not images:
+                lines = [
+                    str(x)
+                    for x in (self.cfg.get("empty_at_replies") or ["怎么了？"])
+                    if str(x).strip()
+                ]
+                await self.reply(event, random.choice(lines) if lines else "怎么了？")
+                return
             # 没点它的话也听着,顺带该复读就复读
             self.remember_ambient(session_key, speaker, text, bool(images))
             await self.maybe_repeat(event, session_key, text, is_group)
             return
+
+        # 早上好 / 晚安 / 生日快乐 这类词,给这轮回复带个方向
+        rule = self.keyword_reaction(ask_text or text)
+        if rule:
+            self.reaction[session_key] = rule
 
         # 成语接龙:接的这一句不走聊天,直接判定
         if playing_idiom and re.fullmatch(r"[\u4e00-\u9fff]{4}", ask_text):
@@ -1473,6 +1587,7 @@ class Bot:
                     event, self.cfg.get("search_hint", "正在联网搜索,请稍等…")
                 )
             started = time.perf_counter()
+            failed = False
             try:
                 answer = await self.ask_deepseek(
                     session_key,
@@ -1481,10 +1596,20 @@ class Bot:
                     use_search=use_search,
                     speaker=speaker,
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception:  # noqa: BLE001
                 log.exception("生成回复出错")
-                answer = f"(出错了:{exc})"
+                failed = True
+                answer = ""
             log.info("生成耗时 %.1fs", time.perf_counter() - started)
+
+            if failed:
+                # 别装死:随口应一声再甩张表情包,免得群里以为「她不理我」
+                await self.reply(event, random.choice(FAIL_LINES))
+                sticker = self.pick_sticker("", session_key)
+                if sticker:
+                    await self.send_sticker(event, sticker)
+                    self.remember_sticker(session_key, sticker.name)
+                return
 
             # 没打 /画,但模型自己判断出用户是在要图(自然语言)
             guess, want_draw = split_draw_marker(answer)
@@ -1520,6 +1645,12 @@ class Bot:
             log.info("表情包:%s(%s)", sticker.name if sticker else "不发", sticker_tag or "-")
 
             if answer:
+                # 出门前洗一遍:拆 markdown、去客服腔、太长就截。
+                # 万一洗空了(整条都是 markdown),那就原样发,别让她真的不说话
+                answer = polish_reply(
+                    answer, int(self.cfg.get("reply_max_chars", 300))
+                ) or answer.strip()
+            if answer:
                 # 长回复拆成几条发,第一条引用对方,看着更像真人
                 await self.send_answer(event, answer)
             if sticker:
@@ -1531,6 +1662,16 @@ class Bot:
                 await self.send_search_images(event, img_keyword)
 
     # ---------- 群里的功能命令 ----------
+
+    def keyword_reaction(self, text: str) -> str:
+        """消息里带了「早上好」「晚安」这类词,就给一句反应方向。"""
+        rules = self.cfg.get("keyword_reactions") or {}
+        if not isinstance(rules, dict) or not text:
+            return ""
+        for word, rule in rules.items():
+            if str(word) and str(word) in text:
+                return str(rule or "").strip()
+        return ""
 
     def is_command(self, text: str) -> bool:
         """这句要不要当命令处理(命令不用 @ 机器人)。"""
@@ -2100,6 +2241,13 @@ class Bot:
 
     async def send_answer(self, event: dict[str, Any], text: str) -> None:
         """聊天回复:分段发,第一条引用对方。"""
+        # 「她刚说过话」和「冷落计数清零」都记在这里,冒泡那条线要靠它
+        if event.get("message_type") == "group" and event.get("group_id") is not None:
+            key = f"group_{event['group_id']}"
+        else:
+            key = f"user_{event.get('user_id')}"
+        self.said_at[key] = time.time()
+        self.silent_streak[key] = 0
         chunks = self.split_reply(text)
         for i, chunk in enumerate(chunks):
             await self.send(event, self.as_segments(event, chunk, quote=(i == 0)))
@@ -2203,11 +2351,16 @@ class Bot:
             return
         idle = float(self.cfg.get("proactive_idle_minutes", 45)) * 60
         need = int(self.cfg.get("proactive_min_messages", 6))
+        sulk = int(self.cfg.get("sulk_after", 5))
         now = time.time()
         for key, last in list(self.last_active.items()):
             if not key.startswith("group_") or now - last < idle:
                 continue
             if (self.stats.get(key) or {}).get("count", 0) < need:
+                continue
+            # 上次说完话之后一直没人接,那就别再往上凑了
+            if sulk and self.silent_streak.get(key, 0) >= sulk:
+                log.info("%s 被冷落 %d 条了,先不冒泡", key, self.silent_streak[key])
                 continue
             if random.random() > float(self.cfg.get("proactive_chance", 0.35)):
                 continue
@@ -2250,6 +2403,13 @@ class Bot:
                 continue
             digest = hashlib.md5(raw).hexdigest()
             if digest in self.known_hashes:
+                continue
+            # 见过一次不算数:截图/照片/商品图基本只出现一次,
+            # 真表情包会被不同的人反复发,攒够次数再收,顺便省一次识图钱
+            seen = self.seen_counts.get(digest, 0) + 1
+            self.seen_counts[digest] = seen
+            if seen < int(self.cfg.get("steal_min_seen", 2)):
+                log.info("这张图第 %d 次见,还不够格,先不收", seen)
                 continue
             kind = str(
                 mimetypes.guess_type(ref.split("?")[0])[0] or "image/jpeg"
