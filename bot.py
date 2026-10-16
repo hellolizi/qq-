@@ -448,7 +448,7 @@ IDIOM_SEED = [
     "日新月异", "后来居上", "画蛇添足", "井底之蛙", "守株待兔",
 ]
 
-VERSION = "2.2.0"  # 发布版本号,改了记得打个 tag
+VERSION = "2.2.1"  # 发布版本号,改了记得打个 tag(仓库根目录 VERSION 文件也要同步)
 
 HELP_TEXT = (
     "小鲸鱼会这些:\n"
@@ -478,7 +478,7 @@ COMMANDS = {
     "帮助", "help", "菜单", "骰", "骰子", "抽签", "运势", "签到", "打卡", "积分",
     "排行榜", "榜", "猜数字", "猜", "成语接龙", "接龙", "结束", "提醒", "提醒列表",
     "取消提醒", "天气", "热搜", "统计", "余额", "额度", "禁言", "解除禁言", "全体禁言",
-    "踢", "踢人",
+    "踢", "踢人", "版本",
 }
 # 这些不用 @ 机器人也能直接触发(画图/搜索/重置沿用原来的处理)
 BYPASS_COMMANDS = COMMANDS | {"画", "搜", "表情", "重置"}
@@ -503,6 +503,13 @@ HELP_WORDS = (
     "命令", "会啥", "会什么", "会做什么", "能干啥", "能干嘛", "能做什么",
     "什么功能", "有啥功能", "哪些功能", "帮助", "菜单",
 )
+# 问它「你什么版本」「小鲸鱼几版了」得能报出来。
+# 只认明确的问法,免得「这个版本不行」这种闲聊被当成命令。
+VERSION_WORDS = (
+    "什么版本", "什么版", "几版本", "几版", "哪个版本", "哪版", "哪一版",
+    "啥版本", "啥版", "多少版本", "版本多少", "版本是啥", "版本号多少",
+    "版本是多少", "报版本",
+)
 
 
 def strip_at_head(text: str) -> str:
@@ -520,6 +527,8 @@ def natural_command(text: str) -> str:
         return ""
     if KICK_RE.search(body) and not any(w in body for w in KICK_STOP):
         return "踢"
+    if any(w in body for w in VERSION_WORDS):
+        return "版本"
     if any(w in body for w in HELP_WORDS):
         return "帮助"
     for kw, cmd in NATURAL_CMDS:
@@ -2772,6 +2781,8 @@ class Bot:
                 else ""
             )
             await self.reply(event, HELP_TEXT + extra)
+        elif head == "版本":
+            await self.reply(event, f"小鲸鱼 v{VERSION}")
         elif head in ("骰", "骰子"):
             await self.reply(event, roll_dice(rest))
         elif head in ("抽签", "运势"):
@@ -3244,6 +3255,7 @@ def other_instance() -> int | None:
 
 def main() -> None:
     cfg = load_config()
+    log.info("小鲸鱼 v%s 启动中…", VERSION)
     if "--check" in sys.argv:
         asyncio.run(check_api(cfg))
         return

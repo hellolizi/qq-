@@ -1,6 +1,6 @@
 # 小鲸鱼
 
-[![version](https://img.shields.io/badge/version-v2.2.0-blue.svg)](https://github.com/hellolizi/qq-/releases)
+[![version](https://img.shields.io/badge/version-v2.2.1-blue.svg)](https://github.com/hellolizi/qq-/releases)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/hellolizi/qq-/pulls)
 [![bug 反馈](https://img.shields.io/badge/bug-反馈给我-red.svg)](https://github.com/hellolizi/qq-/issues)
@@ -12,7 +12,7 @@
 
 - 上手看 **[安装指南 INSTALL.md](INSTALL.md)**，从零到跑起来
 - 遇到 bug 去 **[Issues](https://github.com/hellolizi/qq-/issues)** 提，或者直接在群里 @ 我
-- 当前版本 **v2.2.0**，更新内容见 [更新日志](#更新日志)
+- 当前版本 **v2.2.1**，更新内容见 [更新日志](#更新日志)
 
 ## 她都会啥
 
@@ -157,6 +157,7 @@ QQ
 ## 文件都是啥
 
 - `bot.py` —— 全部逻辑，就这一个文件
+- `VERSION` —— 版本号（就一行，和 `bot.py` 里的 `VERSION`、git tag 对齐）
 - `config.example.json` —— 配置模板，复制一份改名叫 `config.json` 再填
 - `INSTALL.md` —— 安装指南，从零到跑起来
 - `requirements.txt` —— 依赖（websockets / httpx / Pillow）
@@ -295,6 +296,15 @@ NapCat 不回 pong，库就把好端端的连接掐了。现在关掉了客户�
 不想用 GitHub 也行 —— 直接在群里 @ 我，或者把日志贴给我。
 
 ## 更新日志
+
+### v2.2.1
+
+- **版本号看得见了**：双击 `启动.bat` 后，控制台和 `bot.log` 会打一行「小鲸鱼 v2.2.1 启动中」
+- **问版本也能答**：群里直接问「你什么版本」「小鲸鱼几版了」，它自己报版本号（也认 `/版本`）
+- 仓库根目录多了个 `VERSION` 文件，和 `bot.py` 里的版本号、git tag 一起对齐
+- **修了接话窗误开**：日报/主动冒泡/偷表情包原本也会算「她说过话」，会误开接话窗，现在只在真聊天时开
+- **挡住自己的消息**：有的 NapCat 会把她自己发的话推回来，不挡会自问自答
+- `.gitignore` 加保险：`config*.json` 各种变体一并挡住，只放行 `config.example.json`
 
 ### v2.2.0
 
