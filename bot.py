@@ -184,7 +184,9 @@ FAIL_LINES = (
 )
 
 # DeepSeek 官网的价格(元 / 百万 tokens),查额度时报一句给个参照。官方调价记得回来改。
+# 同一个模型的两种叫法都留着:官方文档写 deepseek-v4-flash,但 API 只认 deepseek-flash。
 DS_OFFICIAL_PRICE = {
+    "deepseek-flash": (1, 2),
     "deepseek-v4-flash": (1, 2),
     "deepseek-v4-pro": (3, 6),
 }
@@ -2050,28 +2052,58 @@ class Bot:
             )
         expires = [str(r.get("expires")) for r in used if r.get("expires")]
         tail = f"\n最早到期:{min(expires)}" if expires else ""
-        title = "鲸鲸的白饭还剩这些(阿里云免费额度):"
         _, _, on_official = self.chat_endpoint()
-        if on_official:
-            name = str(self.cfg.get("chat_model") or "")
-            price = DS_OFFICIAL_PRICE.get(name)
-            money = (
-                f"输入 {price[0]} 元 / 输出 {price[1]} 元(每百万 tokens)"
-                if price
-                else "按量扣费"
-            )
-            title = (
-                f"文字聊天走的是 DeepSeek 官网,说一句扣一句的钱,不在这份免费额度里:\n"
-                f"· {name}:{money}\n"
-                f"阿里云这边剩的是识图 / 搜索 / 生图的额度:"
-            )
+        title = (
+            "【阿里云百炼 · 识图 / 搜索 / 生图】"
+            if on_official
+            else "鲸鲸的白饭还剩这些(阿里云免费额度):"
+        )
         return title + "\n" + "\n".join(lines) + tail
 
-    async def fetch_balance(self) -> str:
+    async def fetch_ds_balance(self) -> str:
+        """问 DeepSeek 官网还剩多少钱。"""
+        base, key, on_official = self.chat_endpoint()
+        if not (base and key):
+            return ""
+        name = str(self.cfg.get("chat_model") or "")
+        price = DS_OFFICIAL_PRICE.get(name)
+        money = (
+            f"输入 {price[0]} 元 / 输出 {price[1]} 元(每百万 tokens)"
+            if price
+            else "按量扣费"
+        )
+        head = f"【DeepSeek 官网 · 文字聊天】\n· 模型:{name}, {money}"
+        try:
+            resp = await self.http.get(
+                base + "/user/balance",
+                headers={"Authorization": f"Bearer {key}"},
+            )
+            if resp.status_code != 200:
+                return head + f"\n· 余额没查到(HTTP {resp.status_code})"
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("查 DeepSeek 余额失败: %s", exc)
+            return head + "\n· 余额没查到(连不上)"
+        infos = data.get("balance_infos") or []
+        if not infos:
+            return head + "\n· 余额没查到(接口没给数据)"
+        segs = []
+        for info in infos:
+            cur = str(info.get("currency") or "").upper()
+            sym = {"CNY": "¥", "USD": "$"}.get(cur, cur + " ")
+            total = str(info.get("total_balance") or "0")
+            top = str(info.get("topped_up_balance") or "0")
+            gift = str(info.get("granted_balance") or "0")
+            segs.append(f"{sym}{total}(充值 {top} / 赠送 {gift})")
+        if data.get("is_available") is False:
+            segs.append("余额见底了,可能已经扣不动")
+        return head + "\n· 余额 " + " ".join(segs)
+
+    async def fetch_aliyun_balance(self) -> str:
         """跑一次 bl usage free,问阿里云还剩多少额度。"""
         exe = find_bl()
         if not exe:
-            return "我这边没找到阿里云百炼的命令行工具(bl),装上才能查额度"
+            return "【阿里云百炼】\n没找到命令行工具(bl),装上才能查额度"
         try:
             proc = await asyncio.create_subprocess_exec(
                 exe,
@@ -2084,20 +2116,33 @@ class Bot:
             )
             out, _ = await asyncio.wait_for(proc.communicate(), timeout=25)
         except asyncio.TimeoutError:
-            return "查额度超时了,过会儿再喊我"
+            return "【阿里云百炼】\n查额度超时了,过会儿再喊我"
         except Exception as exc:  # noqa: BLE001
-            return f"查额度失败了({exc})"
+            return f"【阿里云百炼】\n查额度失败了({exc})"
         text = out.decode("utf-8-sig", "replace").strip()
         try:
             rows = json.loads(text)
         except ValueError:
-            return f"查额度没成功,可能要重新登录一次(bl auth login --console)\n{text[:80]}"
+            return (
+                "【阿里云百炼】\n查额度没成功,可能要重新登录一次"
+                f"(bl auth login --console)\n{text[:80]}"
+            )
         if isinstance(rows, dict):
             msg = str((rows.get("error") or {}).get("message") or text[:80])
-            return f"查额度没成功:{msg}\n重新登录一次就好了:bl auth login --console"
+            return f"【阿里云百炼】\n查额度没成功:{msg}\n重新登录一次就好了"
         if not isinstance(rows, list) or not rows:
-            return "没查到免费额度"
+            return "【阿里云百炼】\n没查到免费额度"
         return self.balance_text(rows)
+
+    async def fetch_balance(self) -> str:
+        """两个地方都问一遍:DeepSeek 官网剩多少钱 + 阿里云还剩多少额度。"""
+        ds, ali = await asyncio.gather(
+            self.fetch_ds_balance(), self.fetch_aliyun_balance()
+        )
+        parts = [p for p in (ds, ali) if p]
+        if not parts:
+            return "没查到余额,两边的 key 可能都没配上"
+        return "鲸鲸的两份饭:\n\n" + "\n\n".join(parts)
 
     # --- 群管:禁言 / 踢人 ---
 
