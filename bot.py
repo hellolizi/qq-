@@ -375,6 +375,24 @@ KEYWORDS = {
     "热搜": "/热搜", "帮助": "/帮助", "菜单": "/帮助", "余额": "/余额", "额度": "/余额",
 }
 
+# 没人会老老实实打 /余额,「查一下余额」「还剩多少额度」也得认。
+# 只认短句,而且要排除「余额宝」「支付宝」这种正常聊天。
+NATURAL_CMDS = (("余额", "余额"), ("额度", "余额"))
+NATURAL_STOP = ("余额宝", "支付宝", "微信", "银行卡")
+
+
+def natural_command(text: str) -> str:
+    """把口语说法认成命令,认不出来就返回空。"""
+    body = re.sub(r"[\s,，。!！?？~、]+", "", text.strip().lstrip("/"))
+    if not body or len(body) > 20:
+        return ""
+    if any(w in body for w in NATURAL_STOP):
+        return ""
+    for kw, cmd in NATURAL_CMDS:
+        if kw in body:
+            return cmd
+    return ""
+
 
 def find_bl() -> str | None:
     """找阿里云百炼的命令行工具 bl。PATH 里没有就去默认安装位置翻。"""
@@ -1520,7 +1538,9 @@ class Bot:
         if not t:
             return False
         head = t.split(maxsplit=1)[0]
-        return (head[1:] if head.startswith("/") else t) in BYPASS_COMMANDS
+        if (head[1:] if head.startswith("/") else t) in BYPASS_COMMANDS:
+            return True
+        return bool(natural_command(t))
 
     def parse_at_targets(self, event: dict[str, Any]) -> list[str]:
         """这条消息 @ 了谁(不含机器人自己)。"""
@@ -1949,6 +1969,9 @@ class Bot:
             name = name[1:]
         head, _, rest = name.partition(" ")
         head, rest = head.strip(), rest.strip()
+        if head not in COMMANDS:
+            # 「查一下余额」这种口语说法,也当命令走
+            head, rest = natural_command(raw) or head, ""
         if head not in COMMANDS:
             return False
         user_id = str(event.get("user_id") or "")
