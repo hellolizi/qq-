@@ -2204,21 +2204,32 @@ class Bot:
         ]
         if not live:
             return "【阿里云优惠券】\n没有可用的券了(要么用完了,要么过期了)"
+        def num(v: Any) -> float:
+            try:
+                return float(v or 0)
+            except (TypeError, ValueError):
+                return 0.0
+
         lines: list[str] = []
         total = 0.0
         sym = "¥"
         for c in live:
-            try:
-                rem = float(c.get("RemainAmount") or 0)
-            except (TypeError, ValueError):
-                rem = 0.0
+            rem = num(c.get("RemainAmount"))
+            full = num(c.get("Amount"))
             total += rem
             name = str(c.get("CouponTypeName") or c.get("CouponType") or "优惠券")
             cur = str(c.get("Currency") or "CNY").upper()
             sym = {"CNY": "¥", "USD": "$"}.get(cur, cur + " ")
+            line = f"· {name}: 剩 {sym}{rem:.2f}"
+            if full:
+                line += f" / 共 {sym}{full:.2f}"
+            remark = str(c.get("Remark") or "").strip()
+            if remark:
+                line += f"({remark})"
             end = str(c.get("EndTime") or "")[:10]
-            note = f",{end} 到期" if end else ""
-            lines.append(f"· {name}: 剩 {sym}{rem:.2f}{note}")
+            if end:
+                line += f",{end} 到期"
+            lines.append(line)
         head = f"【阿里云优惠券 · 学生权益】一共还剩 {sym}{total:.2f}"
         return head + "\n" + "\n".join(lines)
 
