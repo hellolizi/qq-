@@ -60,6 +60,32 @@
 - **失败也不装死** —— 模型接口炸了、图取不到的时候，她会说一句「网卡了，重发一遍…」
   再甩张表情包，不会让你对着空气等。
 
+### 文字聊天可以单独接一家
+
+默认所有能力走同一个端点（`deepseek_base_url` + `deepseek_api_key`）。但文字聊天可以单独拎出去：
+
+```json
+"chat_base_url": "https://api.deepseek.com",
+"chat_api_key": "sk-你的key",
+"chat_model": "deepseek-v4-pro",
+"chat_thinking": false
+```
+
+`chat_api_key` 填了，**只有文字聊天**（包括日报、冒泡这些小调用）走这个端点；识图和联网搜索
+留在原端点——因为 `enable_search` 这类是阿里云百炼独有的能力，别家没有。
+
+几个容易踩的点：
+
+- 官网的**思考模式默认是开的**，`chat_thinking: false` 会显式发 `thinking: {"disabled"}`。
+  不关的话群里聊天又慢又费钱（推理的 token 也计费）。
+- 官网只认 `deepseek-v4-flash`（1 元/2 元）和 `deepseek-v4-pro`（3 元/6 元），
+  老名字 `deepseek-chat` / `deepseek-reasoner` 已经弃用（价格是每百万 tokens，输入/输出）。
+- 官网不认百炼那套 `enable_thinking` / `enable_search`，所以走官网时这两个参数不会发出去。
+- `chat_api_key` 留空 = 一切照旧，等于没配。想切回来把 key 清掉就行。
+
+`/余额` 会跟着变：接去官网之后，它会在开头提醒你文字聊天是按量扣费的，下面列的才是
+阿里云那边的免费额度。
+
 ## 怎么跑的
 
 ```

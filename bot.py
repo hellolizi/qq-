@@ -183,6 +183,12 @@ FAIL_LINES = (
     "刚走神了,你刚才说啥",
 )
 
+# DeepSeek 官网的价格(元 / 百万 tokens),查额度时报一句给个参照。官方调价记得回来改。
+DS_OFFICIAL_PRICE = {
+    "deepseek-v4-flash": (1, 2),
+    "deepseek-v4-pro": (3, 6),
+}
+
 # 成语接龙判定:让模型看真假和接得上接不上,顺手给出下一句
 IDIOM_CHECK_TPL = (
     "成语接龙。上一个成语是「{last}」,玩家接的是「{word}」。\n"
@@ -977,6 +983,15 @@ class Bot:
             return None
         return f"data:{mime};base64," + base64.b64encode(raw).decode()
 
+    def chat_endpoint(self) -> tuple[str, str, bool]:
+        """文字聊天走哪个接口:配了 chat_api_key 就单独接一家(比如 DeepSeek 官网),
+        没配就跟识图/搜索/生图共用同一个端点。"""
+        base = str(self.cfg.get("chat_base_url") or "").strip()
+        key = str(self.cfg.get("chat_api_key") or "").strip()
+        if base and key:
+            return base.rstrip("/"), key, True
+        return "", "", False
+
     async def ask_deepseek(
         self,
         session_key: str,
@@ -1033,15 +1048,25 @@ class Bot:
         messages.extend(history[-max_history:])
         messages.append({"role": "user", "content": current})
 
-        url = self.cfg.get("deepseek_base_url", "https://api.deepseek.com").rstrip("/")
-        url += "/chat/completions"
-        # 带图走视觉模型,联网走搜索模型,其余用默认的快模型
-        if images and self.cfg.get("vision_model"):
-            model = self.cfg["vision_model"]
-        elif use_search:
-            model = self.cfg.get("search_model") or self.cfg.get("model", "")
+        # 文字聊天可以单独接到别家(比如 DeepSeek 官网)。
+        # 识图和联网搜索是百炼独有的能力(enable_search),所以它们留在原来的端点。
+        chat_base, chat_key, on_official = self.chat_endpoint()
+        on_official = on_official and not images and not use_search
+        if on_official:
+            url = chat_base + "/chat/completions"
+            api_key = chat_key
+            model = str(self.cfg.get("chat_model") or self.cfg.get("model") or "")
         else:
-            model = self.cfg.get("model", "")
+            url = self.cfg.get("deepseek_base_url", "https://api.deepseek.com").rstrip("/")
+            url += "/chat/completions"
+            api_key = self.cfg["deepseek_api_key"]
+            # 带图走视觉模型,联网走搜索模型,其余用默认的快模型
+            if images and self.cfg.get("vision_model"):
+                model = self.cfg["vision_model"]
+            elif use_search:
+                model = self.cfg.get("search_model") or self.cfg.get("model", "")
+            else:
+                model = self.cfg.get("model", "")
 
         payload: dict[str, Any] = {"model": model, "messages": messages, "stream": False}
         # 聊天回复单独限长:max_tokens 还要留给生图提示词用,别一起调小
@@ -1052,14 +1077,21 @@ class Bot:
         for key in ("temperature", "top_p"):
             if key in self.cfg:
                 payload[key] = self.cfg[key]
-        if use_search and not images:
-            payload["enable_search"] = True  # 搜索模型不支持关思考,别一起传
-        for key in ("enable_thinking", "thinking"):
-            if key in self.cfg and "enable_search" not in payload:
-                payload[key] = self.cfg[key]
+        if on_official:
+            # 官网的思考模式默认就是开的,群里聊天要快,明确关掉;
+            # 它也不认百炼那套 enable_thinking / enable_search,所以只发它认的参数
+            payload["thinking"] = {
+                "type": "enabled" if self.cfg.get("chat_thinking") else "disabled"
+            }
+        else:
+            if use_search and not images:
+                payload["enable_search"] = True  # 搜索模型不支持关思考,别一起传
+            for key in ("enable_thinking", "thinking"):
+                if key in self.cfg and "enable_search" not in payload:
+                    payload[key] = self.cfg[key]
 
         headers = {
-            "Authorization": f"Bearer {self.cfg['deepseek_api_key']}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
 
@@ -1094,15 +1126,28 @@ class Bot:
 
     async def ask_plain(self, prompt: str, max_tokens: int = 80) -> str:
         """问模型一句话,不进对话历史(小游戏判定这种用完就丢的场合用)。"""
-        url = self.cfg.get("deepseek_base_url", "https://api.deepseek.com").rstrip("/")
-        payload = {
-            "model": self.cfg.get("model", "qwen-flash"),
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_tokens,
-            "enable_thinking": False,
-        }
+        chat_base, chat_key, on_official = self.chat_endpoint()
+        if on_official:
+            # 跟聊天走同一家,免得日报/冒泡用的是另一个模型,口吻不统一
+            url = chat_base
+            api_key = chat_key
+            payload: dict[str, Any] = {
+                "model": str(self.cfg.get("chat_model") or self.cfg.get("model") or ""),
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "thinking": {"type": "disabled"},
+            }
+        else:
+            url = self.cfg.get("deepseek_base_url", "https://api.deepseek.com").rstrip("/")
+            api_key = self.cfg["deepseek_api_key"]
+            payload = {
+                "model": self.cfg.get("model", "qwen-flash"),
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "enable_thinking": False,
+            }
         headers = {
-            "Authorization": f"Bearer {self.cfg['deepseek_api_key']}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
         try:
@@ -1967,8 +2012,12 @@ class Bot:
 
     def balance_models(self) -> list[str]:
         """报额度时报哪几个模型,就是机器人自己在用的那几个。"""
+        _, _, on_official = self.chat_endpoint()
+        keys = ["vision_model", "search_model", "image_model", "draw_prompt_model"]
+        if not on_official:  # 文字聊天已经接去别家了,就别在阿里云这边找它
+            keys.insert(0, "model")
         out: list[str] = []
-        for key in ("model", "vision_model", "search_model", "image_model", "draw_prompt_model"):
+        for key in keys:
             name = str(self.cfg.get(key) or "").strip()
             if name and name not in out:
                 out.append(name)
@@ -2001,7 +2050,22 @@ class Bot:
             )
         expires = [str(r.get("expires")) for r in used if r.get("expires")]
         tail = f"\n最早到期:{min(expires)}" if expires else ""
-        return "鲸鲸的白饭还剩这些(阿里云免费额度):\n" + "\n".join(lines) + tail
+        title = "鲸鲸的白饭还剩这些(阿里云免费额度):"
+        _, _, on_official = self.chat_endpoint()
+        if on_official:
+            name = str(self.cfg.get("chat_model") or "")
+            price = DS_OFFICIAL_PRICE.get(name)
+            money = (
+                f"输入 {price[0]} 元 / 输出 {price[1]} 元(每百万 tokens)"
+                if price
+                else "按量扣费"
+            )
+            title = (
+                f"文字聊天走的是 DeepSeek 官网,说一句扣一句的钱,不在这份免费额度里:\n"
+                f"· {name}:{money}\n"
+                f"阿里云这边剩的是识图 / 搜索 / 生图的额度:"
+            )
+        return title + "\n" + "\n".join(lines) + tail
 
     async def fetch_balance(self) -> str:
         """跑一次 bl usage free,问阿里云还剩多少额度。"""
