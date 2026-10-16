@@ -113,7 +113,10 @@ ROUTING_HINT = (
     "要分清谁是谁,别把张三说的话记到李四头上;"
     "顺着话头接的时候,必要时可以带一下对方名字。\n"
     "11. 记住前面聊过什么。别人说「那个」「刚才说的」「再来一个」这种指代,"
-    "要回到上文里找指代对象,不要每次都当成全新话题。"
+    "要回到上文里找指代对象,不要每次都当成全新话题。\n"
+    "12. 群里之前聊的只是背景。别人现在问什么就答什么,"
+    "别把上一轮的旧话题(比如刚聊过的踢人/管理员)硬接过来;"
+    "别人只是叫你一声、没说别的事,就简单应一句,别自己扯开。"
 )
 
 
@@ -488,7 +491,8 @@ KEYWORDS = {
 NATURAL_CMDS = (("余额", "余额"), ("额度", "余额"))
 NATURAL_STOP = ("余额宝", "支付宝", "微信", "银行卡")
 # 「把这个人踢了」「踢了他」这种口语也得认,不然没人老实打 /踢 @某人
-KICK_RE = re.compile(r"(?:把|将|给)[^，。!？?\s]{0,12}?[踢Tt]|[踢Tt](?:出去|掉|走|了)")
+# 只认汉字「踢」:之前把英文 T/t 也算进去,结果「你不用 at 了」里的 t 被当成了踢
+KICK_RE = re.compile(r"(?:把|将|给)[^，。!？?\s]{0,12}?踢|踢(?:出去|掉|走|了)")
 # 但在聊踢球的群里,「把球踢飞了」也是这个句式,别误认
 KICK_STOP = ("踢球", "足球", "踢毽", "踢腿", "踢踏", "踢飞", "球踢")
 # 问「你会啥」的时候得答,不能只认「帮助」「菜单」那两个字
@@ -496,6 +500,12 @@ HELP_WORDS = (
     "命令", "会啥", "会什么", "会做什么", "能干啥", "能干嘛", "能做什么",
     "什么功能", "有啥功能", "哪些功能", "帮助", "菜单",
 )
+
+
+def strip_at_head(text: str) -> str:
+    """去掉开头连着写的 @某某(有的客户端把 @ 并进文字里),
+    这样「@小鲸鱼 /踢 @某人」也能认出那个 /踢。"""
+    return re.sub(r"^(?:@\S+\s*|\[CQ:at,[^\]]*\]\s*)+", "", text.strip()).strip()
 
 
 def natural_command(text: str) -> str:
@@ -820,6 +830,8 @@ class Bot:
         self.last_active: dict[str, float] = {}
         # 没人叫它、它自己插话的时间点,免得连着搭话刷屏
         self.last_chime: dict[str, float] = {}
+        # 她最近一次在群里说话的时刻,用来开「接话窗」:刚聊完那一小会儿,别人接着说的短句也理
+        self.last_bot_speak: dict[str, float] = {}
         # 群成员名单的缓存(群号 -> (取的时刻, 名单)),点名踢人时要用
         self.member_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         # 刷屏检测:群号 -> 人 -> [(时刻, 说了啥)],只看最近一小会儿的
@@ -992,6 +1004,8 @@ class Bot:
     async def send(self, event: dict[str, Any], message: Any) -> None:
         """发送消息。message 可以是纯文本,也可以是 OneBot 消息段列表。"""
         if event.get("message_type") == "group":
+            # 记下她刚说了话,给「接话窗」用
+            self.last_bot_speak[f"group_{event['group_id']}"] = time.time()
             await self.call_api(
                 "send_group_msg",
                 {"group_id": event["group_id"], "message": message},
@@ -1046,6 +1060,13 @@ class Bot:
         """这句里点名它了没(没 @ 也算)。"""
         return any(n in text for n in self.bot_names())
 
+    def _strip_call(self, text: str) -> str:
+        """把这句里叫它的部分(@它 + 名字)抠掉,看剩下多少实内容。"""
+        t = strip_at_head(text)
+        for n in self.bot_names():
+            t = t.replace(n, "")
+        return re.sub(r"[\s,，。!！?？~、]+", "", t)
+
     def in_quiet_hours(self) -> bool:
         """现在是不是免打扰时段(夜里的 23:00~08:00)。"""
         hour = datetime.now().hour
@@ -1083,6 +1104,17 @@ class Bot:
             return None
         key = f"group_{event.get('group_id')}"
         now = time.time()
+        # 她刚说完话的一小会儿:别人接着说的短句、疑问句,就算没 @ 也理,像在接着聊
+        follow = float(self.cfg.get("followup_seconds", 60))
+        if follow > 0 and now - self.last_bot_speak.get(key, 0) <= follow:
+            tail = self._strip_call(text)
+            if (
+                not tail
+                or tail.endswith(("?", "？"))
+                or len(tail) <= int(self.cfg.get("followup_max_chars", 12))
+            ) and not self.in_quiet_hours():
+                self.last_bot_speak[key] = now
+                return text
         if now - self.last_chime.get(key, 0) < float(self.cfg.get("chime_cooldown", 90)):
             return None
         # 上次说完话一直没人接,就别再往上凑了
@@ -1798,6 +1830,16 @@ class Bot:
         else:
             ask_text = self.should_reply(event, text, at_bot, bool(images))
 
+        # 群里只是叫一声「小鲸鱼」、没说事:直接应一声,别让模型去接群里之前的话题
+        if is_group and ask_text is not None and not self._strip_call(ask_text):
+            lines = [
+                str(x)
+                for x in (self.cfg.get("empty_at_replies") or ["怎么了？"])
+                if str(x).strip()
+            ]
+            await self.reply(event, random.choice(lines) if lines else "怎么了？")
+            return
+
         if ask_text is None:
             # 只 @ 了一下、什么都没说:别装没看见,随口应一声
             if is_group and at_bot and not text.strip() and not images:
@@ -1986,7 +2028,7 @@ class Bot:
 
     def is_command(self, text: str) -> bool:
         """这句要不要当命令处理(命令不用 @ 机器人)。"""
-        t = text.strip()
+        t = strip_at_head(text)
         if not t:
             return False
         head = t.split(maxsplit=1)[0]
@@ -2694,7 +2736,7 @@ class Bot:
         self, event: dict[str, Any], text: str, session_key: str, is_group: bool, speaker: str
     ) -> bool:
         """处理命令。返回 True 表示这条已经处理掉了,不用再走聊天。"""
-        raw = text.strip()
+        raw = strip_at_head(text)
         name = KEYWORDS.get(raw, raw)
         if name.startswith("/"):
             name = name[1:]
