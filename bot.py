@@ -102,7 +102,12 @@ ROUTING_HINT = (
     "展开也只讲结论和要点,不要铺垫,不要总结收尾。\n"
     "8. 别露出 AI 味:不要说「作为AI」「请问有什么可以帮您」「希望以上内容对您有帮助」"
     "这类客服话术;不要解释自己在干什么,不要升华总结,不要每次都热情收尾。\n"
-    "9. emoji 和颜文字最多一个,大多数时候一个都别用。"
+    "9. emoji 和颜文字最多一个,大多数时候一个都别用。\n"
+    "10. 群聊里每句话前面都带发言人昵称(格式「昵称: 内容」),"
+    "你自己叫「小鲸鱼」。要分清谁是谁,别把张三说的话记到李四头上;"
+    "顺着话头接的时候,必要时可以带一下对方名字。\n"
+    "11. 记住前面聊过什么。别人说「那个」「刚才说的」「再来一个」这种指代,"
+    "要回到上文里找指代对象,不要每次都当成全新话题。"
 )
 
 
@@ -148,6 +153,12 @@ STICKER_HINT = (
     "那种时候该挑委屈、奶凶、无语、装傻的。\n"
     "4. 大约每三四条回复才发一次,不要连着发。\n"
     "5. 正文照常写,不要只写标记。"
+)
+
+# 群里没点它的那些话,当背景喂给模型,让它知道大家在聊什么
+AMBIENT_TPL = (
+    "\n\n【群里刚才的聊天(只是让你知道气氛和话头,"
+    "别主动去回这些,也别被带跑题)】\n{chat}\n"
 )
 
 
@@ -241,6 +252,8 @@ class Bot:
         self.stickers, self.sticker_tags = self._load_stickers()
         # 最近一次收到任何消息的时间,NapCat 每 30 秒会推心跳,拿它判断连接死没死
         self.last_msg_at = time.time()
+        # 群里没点它的话,也顺手记下来当背景,不然它不知道群里在聊什么
+        self.ambient: dict[str, list[str]] = defaultdict(list)
 
     # ---------- 表情包 ----------
 
@@ -312,6 +325,22 @@ class Bot:
         sent = self.recent_stickers[session_key]
         sent.append(name)
         del sent[:-keep]
+
+    def remember_ambient(
+        self, session_key: str, speaker: str, text: str, has_image: bool
+    ) -> None:
+        """记下没点它的那句群消息,当上下文背景用。"""
+        keep = int(self.cfg.get("ambient_lines", 30))
+        if keep <= 0:
+            return
+        line = (f"{speaker}: {text}" if speaker else text).strip()
+        if has_image:
+            line = f"{line} [图片]".strip()
+        if not line:
+            return
+        buf = self.ambient[session_key]
+        buf.append(line[:100])
+        del buf[:-keep]
 
     # ---------- 域名白名单 ----------
 
@@ -449,12 +478,15 @@ class Bot:
         user_text: str,
         images: list[str] | None = None,
         use_search: bool = False,
+        speaker: str = "",
     ) -> str:
         history = self.history[session_key]
         images = images or []
+        # 群里好几个人说话,不标名字模型分不清谁说的,上下文就废了一半
+        text = f"{speaker}: {user_text}".strip() if speaker else user_text
 
         # 本轮消息:带图就拼成多模态内容
-        current: Any = user_text
+        current: Any = text
         if images:
             parts: list[dict[str, Any]] = []
             lost = 0
@@ -465,12 +497,12 @@ class Bot:
                 else:
                     lost += 1
             if parts:
-                parts.append({"type": "text", "text": user_text or "看看这张图"})
+                parts.append({"type": "text", "text": text or "看看这张图"})
                 current = parts
             elif lost:
                 # 一张都没取到就直说,别让模型对着空图瞎猜
                 note = "(图我这边没取到,你重新发一次,或者直接描述一下图上是什么也行)"
-                current = f"{user_text} {note}".strip()
+                current = f"{text} {note}".strip()
 
         max_history = int(self.cfg.get("max_history", 20))
         messages: list[dict[str, Any]] = []
@@ -480,6 +512,8 @@ class Bot:
             system_prompt += SEARCH_HINT
         if self.stickers and not images:
             system_prompt += STICKER_HINT.format(items=self.sticker_list_text())
+        if self.ambient.get(session_key):
+            system_prompt += AMBIENT_TPL.format(chat="\n".join(self.ambient[session_key]))
         messages.append({"role": "system", "content": system_prompt})
         messages.extend(history[-max_history:])
         messages.append({"role": "user", "content": current})
@@ -523,7 +557,7 @@ class Bot:
 
         # 上下文里只留纯文字,避免每轮重传整张图
         history.append(
-            {"role": "user", "content": f"{user_text} [图片]".strip() if images else user_text}
+            {"role": "user", "content": f"{text} [图片]".strip() if images else text}
         )
         # [DRAW] / [FIND] / [IMG] / [STICKER] 只是给程序看的标记,别原样留在上下文里
         _, want_draw = split_draw_marker(content)
@@ -866,6 +900,9 @@ class Bot:
         session_key = (
             f"group_{event['group_id']}" if is_group else f"user_{event['user_id']}"
         )
+        sender = event.get("sender") or {}
+        # 群里用群名片,没有就用昵称;上下文里带着它,模型才分得清谁在说话
+        speaker = str(sender.get("card") or sender.get("nickname") or "").strip()
 
         # 群里常见操作:先单独发张图,再 @ 机器人问「这是什么」。
         # 所以图片消息就算没点它,也先记下来,供后面几条消息用。
@@ -874,6 +911,8 @@ class Bot:
 
         ask_text = self.should_reply(event, text, at_bot, bool(images))
         if ask_text is None:
+            # 没点它的话也听着:不然它只知道被问的那几句,压根不知道群里在聊啥
+            self.remember_ambient(session_key, speaker, text, bool(images))
             return
 
         # 这条没带图,但刚发过图,就把它接上。
@@ -926,7 +965,7 @@ class Bot:
             "[%s] %s%s: %s%s",
             session_key,
             "[生图] " if use_image else ("[联网] " if use_search else ""),
-            event.get("sender", {}).get("nickname", "?"),
+            speaker or "?",
             ask_text[:60],
             f" (+{len(images)}图)" if images else "",
         )
@@ -943,7 +982,11 @@ class Bot:
             started = time.perf_counter()
             try:
                 answer = await self.ask_deepseek(
-                    session_key, ask_text, images=images, use_search=use_search
+                    session_key,
+                    ask_text,
+                    images=images,
+                    use_search=use_search,
+                    speaker=speaker,
                 )
             except Exception as exc:  # noqa: BLE001
                 log.exception("生成回复出错")
