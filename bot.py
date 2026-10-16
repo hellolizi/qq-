@@ -2650,9 +2650,9 @@ class Bot:
         for t in targets:
             role = await self.member_role(group_id, t)
             if role == "owner":
-                return "那是群主。QQ 不许踢群主,我这号也当不了群主 —— 只能他自己退群,或者先把群主转给别人"
+                return "那是群主。QQ 不许踢群主 —— 只能他自己退群,或者先把群主转给别人"
             if role == "admin" and self_role != "owner":
-                return "他也是管理员。踢人的动作是我这个号发的,QQ 不许管理员踢管理员 —— 你自己在群里点一下吧"
+                return "他也是管理员,我这号也是管理员就压不住他 —— 把我这号设成群主就能踢了,或者你自己在群里点一下"
         if head in ("踢", "踢人"):
             for t in targets:
                 resp = await self.call_api_wait(
