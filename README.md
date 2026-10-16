@@ -33,6 +33,11 @@
   另外机器人只能动**普通成员**：踢不动、也禁不了群主和其他管理员。原因是踢人这个动作是
   **机器人这个号**发出去的，QQ 只认这个号自己的身份——它顶多是个管理员，只有群主才压得住管理员，
   而机器人当不了群主。这种情况它会直接把原因说清楚，不会假装踢成功了。
+- **自动禁言刷屏** —— 同一个人 15 秒内连着刷 6 遍同一句话（单条 ≥4 字），自动禁言 10 分钟，
+  并在群里说一句「别刷了 先歇 10 分钟」。这是**硬规则，不交给模型判断**——
+  踢人拉不回来，禁言到点自己会解，所以只做到禁言这一层。
+  群里好几个人一起复读同一句（接梗）不算刷屏；群主/管理员/`admin_users` 一律不动；
+  一天最多禁 10 个人。阈值都在 `spam_*` 那几个配置里，嫌严就把 `spam_count` 调大。
 - **群统计** —— `/统计` 看今天这个群聊了多少条、谁最活跃、几点最热闹。
 - **余额** —— `/余额` **三个地方都查**：DeepSeek 官网还剩多少钱（问 `/user/balance`）、
   阿里云账户还剩多少（现金走 `QueryAccountBalance`，优惠券走 `DescribeCoupon`，学生那 300 元就在券里）、
@@ -170,6 +175,9 @@ QQ
 - `chime_chance` / `chime_cooldown` —— 没人叫时插话的概率、两次插话至少隔多少秒
 - `default_city` —— `/天气` 不带城市时用哪个
 - `admin_cmds` / `admin_users` —— 群管命令开关；`admin_users` 里写死几个 QQ 号也能用
+- `auto_mute_spam` / `spam_count` / `spam_window` —— 刷屏自动禁言：多久内、刷几遍同一句算刷屏
+- `spam_min_chars` / `spam_mute_seconds` / `spam_mute_max_per_day` —— 多短的话不算、
+  禁多久、一天最多禁几个。`auto_mute_spam` 设 false 就只记录不动作
 - `welcome_text` / `recall_notice` / `repeat_enabled` —— 入群欢迎语、防撤回、复读接梗的开关
 - `split_reply` / `quote_reply` —— 长回复分段发、回复时引用原消息
 - `memory_days` / `memory_recall` —— 长期记忆存多少天、每次捞几条

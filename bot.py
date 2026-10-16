@@ -750,6 +750,9 @@ class Bot:
         self.last_chime: dict[str, float] = {}
         # 群成员名单的缓存(群号 -> (取的时刻, 名单)),点名踢人时要用
         self.member_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        # 刷屏检测:群号 -> 人 -> [(时刻, 说了啥)],只看最近一小会儿的
+        self.spam_track: dict[str, dict[str, list[tuple[float, str]]]] = {}
+        self.mute_count: dict[str, Any] = {"day": "", "n": 0}
         self.reported_day = ""
         self.steal_count: dict[str, Any] = {"day": "", "n": 0}
         self.known_hashes: set[str] = self._hash_stickers()
@@ -1592,6 +1595,10 @@ class Bot:
             ):
                 self.silent_streak[session_key] = self.silent_streak.get(session_key, 0) + 1
 
+        # 刷屏就先禁言。这条是硬规则、不问模型 —— 误踢人拉不回来,禁言到点自己会解
+        if is_group and text:
+            await self.check_spam(event, text)
+
         # 防撤回:先把这条原文记下来,因为撤回事件里只有一个 message_id
         if is_group and text:
             self.recall_cache.append(
@@ -2380,6 +2387,59 @@ class Bot:
         return "鲸鲸的白饭账本:\n\n" + "\n\n".join(parts)
 
     # --- 群管:禁言 / 踢人 ---
+
+    async def check_spam(self, event: dict[str, Any], text: str) -> None:
+        """同一个人短时间里反复刷同一句话,就先禁言。
+        故意做成硬规则、不交给模型裁决 —— 踢人拉不回来,禁言到点自己会解。
+        """
+        if not self.cfg.get("auto_mute_spam", True) or not text:
+            return
+        if len(text) < int(self.cfg.get("spam_min_chars", 4)):
+            return  # 「6」「哈哈」这种跟着刷的,不算
+        group_id = event.get("group_id")
+        user_id = str(event.get("user_id") or "")
+        if not (group_id and user_id):
+            return
+        window = float(self.cfg.get("spam_window", 15))
+        need = int(self.cfg.get("spam_count", 6))
+        now = time.time()
+        per_group = self.spam_track.setdefault(str(group_id), {})
+        hist = [x for x in per_group.get(user_id, []) if now - x[0] <= window]
+        hist.append((now, text))
+        per_group[user_id] = hist
+        if len([x for x in hist if x[1] == text]) < need:
+            return
+        # 还有别人也在刷同一句 —— 那是群里在接梗复读,不是他一个人刷,别动
+        for other, h in per_group.items():
+            if other == user_id:
+                continue
+            if len([x for x in h if x[1] == text and now - x[0] <= window]) >= need // 2:
+                return
+        per_group[user_id] = []  # 认定了就清掉,别重复禁
+        if user_id in [str(u) for u in (self.cfg.get("admin_users") or [])]:
+            return
+        if await self.member_role(group_id, user_id) in ("owner", "admin"):
+            return
+        if await self.member_role(group_id, self.self_id) not in ("owner", "admin"):
+            log.warning("有人刷屏,可我不是群管理,禁不了")
+            return
+        day = datetime.now().strftime("%Y-%m-%d")
+        if self.mute_count.get("day") != day:
+            self.mute_count = {"day": day, "n": 0}
+        if self.mute_count["n"] >= int(self.cfg.get("spam_mute_max_per_day", 10)):
+            return
+        seconds = int(self.cfg.get("spam_mute_seconds", 600))
+        resp = await self.call_api_wait(
+            "set_group_ban",
+            {"group_id": group_id, "user_id": user_id, "duration": seconds},
+        )
+        if resp.get("status") != "ok":
+            log.warning("刷屏禁言没成功: %s", api_fail_reason(resp))
+            return
+        self.mute_count["n"] += 1
+        who = await self.member_name(group_id, user_id) or user_id
+        log.info("刷屏禁言: %s %s 秒", who, seconds)
+        await self.reply(event, f"{who} 别刷了 先歇 {seconds // 60} 分钟")
 
     async def do_admin(
         self, event: dict[str, Any], head: str, rest: str, is_group: bool
