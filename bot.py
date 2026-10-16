@@ -207,6 +207,12 @@ def _bss_sign(params: dict[str, str], secret: str) -> str:
     digest = hmac.new((secret + "&").encode(), to_sign.encode(), hashlib.sha1).digest()
     return base64.b64encode(digest).decode()
 
+
+def is_deepseek(model: Any) -> bool:
+    """是不是 DeepSeek 家的模型(官网、百炼都叫 deepseek-*)。"""
+    return str(model or "").strip().lower().startswith("deepseek")
+
+
 # 成语接龙判定:让模型看真假和接得上接不上,顺手给出下一句
 IDIOM_CHECK_TPL = (
     "成语接龙。上一个成语是「{last}」,玩家接的是「{word}」。\n"
@@ -1087,10 +1093,12 @@ class Bot:
                 model = self.cfg.get("model", "")
 
         payload: dict[str, Any] = {"model": model, "messages": messages, "stream": False}
-        # 聊天回复单独限长:max_tokens 还要留给生图提示词用,别一起调小
-        payload["max_tokens"] = int(
-            self.cfg.get("reply_max_tokens") or self.cfg.get("max_tokens", 400)
-        )
+        # 聊天回复单独限长:max_tokens 还要留给生图提示词用,别一起调小。
+        # 搜索的答案是把资料揉进去讲,比闲聊长,还按 120 会拦腰截断。
+        limit = self.cfg.get("reply_max_tokens") or self.cfg.get("max_tokens", 400)
+        if use_search and not images:
+            limit = self.cfg.get("max_tokens", 400)
+        payload["max_tokens"] = int(limit)
         # 把 config 里额外的 OpenAI 兼容参数原样透传
         for key in ("temperature", "top_p"):
             if key in self.cfg:
@@ -1103,7 +1111,11 @@ class Bot:
             }
         else:
             if use_search and not images:
-                payload["enable_search"] = True  # 搜索模型不支持关思考,别一起传
+                payload["enable_search"] = True
+                # 百炼的 DeepSeek 默认开着思考,正文会被思考烧成一串空字符,
+                # 所以搜索这条路上也得显式关掉。通义本来不用,但传了也无害。
+                if is_deepseek(model):
+                    payload["enable_thinking"] = False
             for key in ("enable_thinking", "thinking"):
                 if key in self.cfg and "enable_search" not in payload:
                     payload[key] = self.cfg[key]
@@ -1207,6 +1219,9 @@ class Bot:
             "max_tokens": self.cfg.get("max_tokens", 400),
             "enable_search": True,
         }
+        # 同上:DeepSeek 不关思考的话扩写结果会变成空串,白退回原始描述
+        if is_deepseek(model):
+            payload["enable_thinking"] = False
         try:
             resp = await self.http.post(url, json=payload, headers=headers, timeout=180)
             resp.raise_for_status()
