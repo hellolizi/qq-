@@ -227,6 +227,19 @@ def strip_self_prefix(text: str, names: tuple[str, ...] | list[str] = ()) -> str
     return out
 
 
+def api_fail_reason(resp: dict[str, Any]) -> str:
+    """接口没成功时,把原因说成人话,别老是甩「得让我当群管理」。"""
+    msg = str(resp.get("message") or resp.get("wording") or resp.get("msg") or "").strip()
+    if msg:
+        return msg
+    code = resp.get("retcode")
+    if code == 1404:
+        return "这人不在群里了"
+    if code in (1403, 1401):
+        return "我权限不够(QQ 那边拒的)"
+    return f"QQ 那边拒了(retcode {code})"
+
+
 def split_draw_marker(text: str) -> tuple[str, bool]:
     """找出 `[DRAW]` 标记,返回(标记之后的画面描述, 是否要生图)。
 
@@ -1897,6 +1910,14 @@ class Bot:
             return "解除全员禁言" if resp.get("status") == "ok" else "没弄成,得让我当群管理"
         if not targets:
             return "要 @ 一个人,比如 /禁言 @某人 10分钟"
+        # 机器人自己顶多是个管理员:管理员之间、管理员对群主,QQ 都不让动,先拦下来
+        self_role = await self.member_role(group_id, self.self_id)
+        for t in targets:
+            role = await self.member_role(group_id, t)
+            if role == "owner":
+                return "那是群主,我没资格动"
+            if role == "admin" and self_role != "owner":
+                return "他也是管理员,跟我平级 —— 管理员之间踢不动也禁不了,只有群主能"
         if head in ("踢", "踢人"):
             for t in targets:
                 resp = await self.call_api_wait(
@@ -1904,7 +1925,7 @@ class Bot:
                     {"group_id": group_id, "user_id": t, "reject_add_request": False},
                 )
                 if resp.get("status") != "ok":
-                    return "没踢动,得让我当群管理"
+                    return "没踢动:" + api_fail_reason(resp)
             return "请出去了"
         seconds, _, _ = parse_duration(rest)
         seconds = seconds or int(self.cfg.get("ban_seconds", 600))
@@ -1915,7 +1936,7 @@ class Bot:
                 {"group_id": group_id, "user_id": t, "duration": seconds},
             )
             if resp.get("status") != "ok":
-                return "没禁上,得让我当群管理"
+                return "没禁上:" + api_fail_reason(resp)
         return f"禁言 {seconds // 60} 分钟"
 
     async def handle_command(
