@@ -956,7 +956,7 @@ class Bot:
 
     def bot_names(self) -> list[str]:
         """别人平时怎么叫它。叫到名字它就得答应。"""
-        names = self.cfg.get("bot_names") or ["小鲸鱼", "小鲸", "鲸鲸"]
+        names = self.cfg.get("bot_names") or ["小鲸鱼", "鲸鱼", "小鲸", "鲸鲸"]
         return [str(n).strip() for n in names if str(n).strip()]
 
     def mentions_me(self, text: str) -> bool:

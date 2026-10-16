@@ -161,7 +161,8 @@ QQ
 - `sticker_chance` —— 模型想发表情包时，真正发出去的概率（不然每条都发就刷屏了）
 - `group_trigger` —— `smart`（默认：被叫必回，没人叫也可能搭一句）/ `at`（只理 @ 和点名）/
   `prefix`（只理带 `group_prefix` 的）/ `all`（每条都回）
-- `bot_names` —— 别人怎么叫它算「点名」。写进去的词一出现就必须回，所以别放太常见的词
+- `bot_names` —— 别人怎么叫它算「点名」。默认 `小鲸鱼` / `鲸鱼` / `小鲸` / `鲸鲸`，
+  写进去的词一出现就必须回，所以别放太常见的词
 - `chime_chance` / `chime_cooldown` —— 没人叫时插话的概率、两次插话至少隔多少秒
 - `default_city` —— `/天气` 不带城市时用哪个
 - `admin_cmds` / `admin_users` —— 群管命令开关；`admin_users` 里写死几个 QQ 号也能用
