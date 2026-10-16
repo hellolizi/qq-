@@ -31,12 +31,12 @@
   机器人当不了群主），这种情况下它会直接说明原因，不会假装踢成功了。
 - **群统计** —— `/统计` 看今天这个群聊了多少条、谁最活跃、几点最热闹。
 - **余额** —— `/余额` **三个地方都查**：DeepSeek 官网还剩多少钱（问 `/user/balance`）、
-  阿里云的优惠券还剩多少（费用与成本 `DescribeCoupon`，学生那 300 元就在这）、
+  阿里云账户还剩多少（现金走 `QueryAccountBalance`，优惠券走 `DescribeCoupon`，学生那 300 元就在券里）、
   百炼那几个模型还剩多少免费 token 额度（`bl usage free`）。都是问官方接口，不是自己估的。
   哪一段没配 key 就自动不显示，不会报错。
-- `aliyun_access_key_id` / `aliyun_access_key_secret` —— 查那 300 元优惠券要用的 RAM 密钥。
-  **注意这是第三套密钥**，跟百炼的、DeepSeek 的都不同。留空 = 不查优惠券。
-  建议用子账号、只给 `bss:DescribeCoupons` 这一条权限，见下面「怎么用起来」第 8 条。
+- `aliyun_access_key_id` / `aliyun_access_key_secret` —— 查阿里云现金和那 300 元优惠券要用的 RAM 密钥。
+  **注意这是第三套密钥**，跟百炼的、DeepSeek 的都不同。留空 = 不查阿里云这一段。
+  建议用子账号、只给 `bss:DescribeCoupons` 和 `bss:QueryAccountBalance` 这两条权限，见下面「怎么用起来」第 8 条。
 
 群聊默认要 @ 才理，不然太吵。聊天里的「闲聊」她只听不答（当上下文背景），
 所以她知道群里刚在聊什么，但不会插嘴。

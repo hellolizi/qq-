@@ -193,10 +193,11 @@ DS_OFFICIAL_PRICE = {
     "deepseek-v4-pro": (3, 6),
 }
 
-# 阿里云的优惠券(学生那 300 元就在这)。它是账户级卡券,百炼那套接口看不到,
+# 阿里云的账户余额和优惠券(学生那 300 元就在券里)。这都是账户级的东西,百炼那套接口看不到,
 # 得走费用与成本 OpenAPI,而且要一对 AccessKey。签名是老的 RPC 规矩,自己算免得再装 CLI。
 BSS_HOST = "https://business.aliyuncs.com/"
-BSS_VERSION = "2023-09-30"
+BSS_VERSION = "2023-09-30"  # DescribeCoupon 用的版本号
+BSS_LEGACY_VERSION = "2017-12-14"  # QueryAccountBalance 还是老版本,别跟着上面那个改
 
 
 def _bss_sign(params: dict[str, str], secret: str) -> str:
@@ -2165,79 +2166,103 @@ class Bot:
             return "【阿里云百炼】\n没查到免费额度"
         return self.balance_text(rows)
 
-    async def fetch_coupon_balance(self) -> str:
-        """问阿里云费用中心还剩多少优惠券(学生那 300 元就在这)。
-
-        百炼的接口看不到它——优惠券是账户级的东西,要走费用与成本 OpenAPI,
-        签名是老的 RPC 规矩,所以得自己算,别指望 bl 帮忙。
-        """
+    async def _bss_call(
+        self, action: str, version: str, extra: dict[str, str] | None = None
+    ) -> tuple[dict[str, Any] | None, str]:
+        """调一次阿里云费用中心的 RPC 接口,回 (数据, 错误说明)。签名自己算。"""
         ak = str(self.cfg.get("aliyun_access_key_id") or "").strip()
         sk = str(self.cfg.get("aliyun_access_key_secret") or "").strip()
-        if not (ak and sk):
-            return ""
-        params = {
-            "Action": "DescribeCoupon",
-            "Version": BSS_VERSION,
+        params: dict[str, str] = {
+            "Action": action,
+            "Version": version,
             "Format": "JSON",
             "AccessKeyId": ak,
             "SignatureMethod": "HMAC-SHA1",
             "SignatureVersion": "1.0",
             "Timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "SignatureNonce": str(uuid.uuid4()),
-            "CurrentPage": "1",
-            "PageSize": "50",
         }
+        params.update(extra or {})
         params["Signature"] = _bss_sign(params, sk)
         try:
             resp = await self.http.get(BSS_HOST, params=params)
             data = resp.json()
         except Exception as exc:  # noqa: BLE001
-            log.warning("查阿里云优惠券失败: %s", exc)
-            return "【阿里云优惠券】\n没查到(连不上)"
-        if resp.status_code != 200 or data.get("Code"):
-            msg = str(data.get("Message") or f"HTTP {resp.status_code}")
-            return f"【阿里云优惠券】\n没查到:{msg}"
-        live = [
-            c
-            for c in (data.get("Data") or [])
-            if str(c.get("Status") or "").lower().startswith("available")
-        ]
-        if not live:
-            return "【阿里云优惠券】\n没有可用的券了(要么用完了,要么过期了)"
-        def num(v: Any) -> float:
-            try:
-                return float(v or 0)
-            except (TypeError, ValueError):
-                return 0.0
+            log.warning("调阿里云 %s 失败: %s", action, exc)
+            return None, "连不上"
+        if resp.status_code != 200 or data.get("Code") not in (None, "200", "Success"):
+            return None, str(data.get("Message") or f"HTTP {resp.status_code}")
+        return data, ""
 
+    @staticmethod
+    def _num(v: Any) -> float:
+        try:
+            return float(v or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    async def fetch_aliyun_money(self) -> str:
+        """问阿里云账户还剩多少钱:现金余额 + 优惠券(学生那 300 元就在券里)。
+
+        这两个是分开的接口——现金走 QueryAccountBalance(老版本号),
+        券走 DescribeCoupon。账户里现金常常是零,能花的钱其实都在券里,所以两样都报。
+        """
+        ak = str(self.cfg.get("aliyun_access_key_id") or "").strip()
+        sk = str(self.cfg.get("aliyun_access_key_secret") or "").strip()
+        if not (ak and sk):
+            return ""
+        cash_body, cash_err = await self._bss_call(
+            "QueryAccountBalance", BSS_LEGACY_VERSION
+        )
+        coupon_body, coupon_err = await self._bss_call(
+            "DescribeCoupon", BSS_VERSION, {"CurrentPage": "1", "PageSize": "50"}
+        )
         lines: list[str] = []
-        total = 0.0
-        sym = "¥"
-        for c in live:
-            rem = num(c.get("RemainAmount"))
-            full = num(c.get("Amount"))
-            total += rem
-            name = str(c.get("CouponTypeName") or c.get("CouponType") or "优惠券")
-            cur = str(c.get("Currency") or "CNY").upper()
+        num = self._num
+        if cash_body is None:
+            lines.append(f"· 现金余额:没查到({cash_err})")
+        else:
+            cash = cash_body.get("Data") or {}
+            cur = str(cash.get("Currency") or "CNY").upper()
             sym = {"CNY": "¥", "USD": "$"}.get(cur, cur + " ")
-            line = f"· {name}: 剩 {sym}{rem:.2f}"
-            if full:
-                line += f" / 共 {sym}{full:.2f}"
-            remark = str(c.get("Remark") or "").strip()
-            if remark:
-                line += f"({remark})"
-            end = str(c.get("EndTime") or "")[:10]
-            if end:
-                line += f",{end} 到期"
-            lines.append(line)
-        head = f"【阿里云优惠券 · 学生权益】一共还剩 {sym}{total:.2f}"
-        return head + "\n" + "\n".join(lines)
+            lines.append(f"· 现金余额:{sym}{num(cash.get('AvailableCashAmount')):.2f}")
+        if coupon_body is None:
+            lines.append(f"· 抵用券:没查到({coupon_err})")
+        else:
+            live = [
+                c
+                for c in (coupon_body.get("Data") or [])
+                if str(c.get("Status") or "").lower().startswith("available")
+            ]
+            if not live:
+                lines.append("· 抵用券:没有可用的了(要么用完了,要么过期了)")
+            else:
+                total = 0.0
+                for c in live:
+                    rem = num(c.get("RemainAmount"))
+                    full = num(c.get("Amount"))
+                    total += rem
+                    name = str(c.get("CouponTypeName") or c.get("CouponType") or "优惠券")
+                    cur = str(c.get("Currency") or "CNY").upper()
+                    sym = {"CNY": "¥", "USD": "$"}.get(cur, cur + " ")
+                    line = f"· {name}: 剩 {sym}{rem:.2f}"
+                    if full:
+                        line += f" / 共 {sym}{full:.2f}"
+                    remark = str(c.get("Remark") or "").strip()
+                    if remark:
+                        line += f"({remark})"
+                    end = str(c.get("EndTime") or "")[:10]
+                    if end:
+                        line += f",{end} 到期"
+                    lines.append(line)
+                lines.append(f"(券合计还剩 {sym}{total:.2f})")
+        return "【阿里云账户 · 学生权益】\n" + "\n".join(lines)
 
     async def fetch_balance(self) -> str:
-        """三个地方都问一遍:DeepSeek 官网余额 + 阿里云优惠券 + 百炼免费额度。"""
+        """三处都问一遍:DeepSeek 官网余额 + 阿里云账户(现金+券) + 百炼免费额度。"""
         ds, coupon, ali = await asyncio.gather(
             self.fetch_ds_balance(),
-            self.fetch_coupon_balance(),
+            self.fetch_aliyun_money(),
             self.fetch_aliyun_balance(),
         )
         parts = [p for p in (ds, coupon, ali) if p]
