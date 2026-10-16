@@ -106,8 +106,9 @@ ROUTING_HINT = (
     "8. 别露出 AI 味:不要说「作为AI」「请问有什么可以帮您」「希望以上内容对您有帮助」"
     "这类客服话术;不要解释自己在干什么,不要升华总结,不要每次都热情收尾。\n"
     "9. emoji 和颜文字最多一个,大多数时候一个都别用。\n"
-    "10. 群聊里每句话前面都带发言人昵称(格式「昵称: 内容」),"
-    "你自己叫「小鲸鱼」。要分清谁是谁,别把张三说的话记到李四头上;"
+    "10. 群聊里别人说的话前面带发言人昵称(格式「昵称: 内容」),"
+    "你自己叫「小鲸鱼」,但你回话的时候不要在自己前面加「小鲸鱼:」,直接说内容就行。"
+    "要分清谁是谁,别把张三说的话记到李四头上;"
     "顺着话头接的时候,必要时可以带一下对方名字。\n"
     "11. 记住前面聊过什么。别人说「那个」「刚才说的」「再来一个」这种指代,"
     "要回到上文里找指代对象,不要每次都当成全新话题。"
@@ -206,6 +207,16 @@ def split_sticker_marker(text: str) -> tuple[str, str]:
         tag = ""
     body = (text[: match.start()] + text[match.end():]).strip().strip("`").strip()
     return body, tag
+
+
+# 上下文里别人说话都是「昵称: 内容」,模型有时会照抄这个格式,
+# 在自己回复前面也顶一个「小鲸鱼:」——那是它自己的名字,不该出现在话里。
+SELF_PREFIX_RE = re.compile(r"^\s*(?:小鲸鱼|鲸鲸|鲸鱼娘)\s*[:：]\s*")
+
+
+def strip_self_prefix(text: str) -> str:
+    """去掉模型自己加在句首的「小鲸鱼:」。"""
+    return SELF_PREFIX_RE.sub("", text, count=1).strip()
 
 
 def split_draw_marker(text: str) -> tuple[str, bool]:
@@ -927,7 +938,9 @@ class Bot:
             log.error("模型返回 %s: %s", resp.status_code, resp.text[:300])
             raise RuntimeError(f"模型接口错误 {resp.status_code}")
 
-        content = (resp.json()["choices"][0]["message"].get("content") or "").strip()
+        content = strip_self_prefix(
+            (resp.json()["choices"][0]["message"].get("content") or "").strip()
+        )
 
         # 上下文里只留纯文字,避免每轮重传整张图
         history.append(
@@ -967,7 +980,9 @@ class Bot:
             if resp.status_code != 200:
                 log.warning("小模型调用返回 %s", resp.status_code)
                 return ""
-            return (resp.json()["choices"][0]["message"].get("content") or "").strip()
+            return strip_self_prefix(
+                (resp.json()["choices"][0]["message"].get("content") or "").strip()
+            )
         except Exception as exc:  # noqa: BLE001
             log.warning("小模型调用失败:%s", exc)
             return ""
@@ -1234,7 +1249,9 @@ class Bot:
             timeout=120,
         )
         resp.raise_for_status()
-        return (resp.json()["choices"][0]["message"].get("content") or "").strip()
+        return strip_self_prefix(
+            (resp.json()["choices"][0]["message"].get("content") or "").strip()
+        )
 
     async def find_reference_image(self, name: str) -> bytes | None:
         """搜一张该角色的真实图,并用识图模型确认图里确实是它 —— 确认不了就返回 None。
