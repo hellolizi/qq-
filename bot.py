@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import ctypes
+import hashlib
 import html
 import json
 import logging
@@ -162,6 +163,12 @@ AMBIENT_TPL = (
     "别主动去回这些,也别被带跑题)】\n{chat}\n"
 )
 
+# 长期记忆捞出来的旧聊天
+MEMORY_TPL = (
+    "\n\n【你记得以前在这个群里聊过这些(不一定跟现在有关)】\n{items}\n"
+    "跟眼前的话题沾边就自然带一句,不沾边就别硬提,别提「根据我的记忆」这种话。\n"
+)
+
 # 成语接龙判定:让模型看真假和接得上接不上,顺手给出下一句
 IDIOM_CHECK_TPL = (
     "成语接龙。上一个成语是「{last}」,玩家接的是「{word}」。\n"
@@ -235,6 +242,20 @@ BROWSER_UA = (
 # ---------- 群功能用到的常量 ----------
 
 DATA_FILE = BASE_DIR / "data.json"  # 积分 / 签到 / 提醒的小存档
+MEMORY_FILE = BASE_DIR / "memory.json"  # 长期记忆:聊天存档
+
+# 偷表情包:让识图模型判断这张图是不是表情包
+STEAL_PROMPT = (
+    "看这张图,判断它是不是聊天用的表情包(而不是照片、截图、商品图、科普图、聊天记录)。\n"
+    "只回一行 JSON,不要解释:\n"
+    '{"meme":true,"emotion":"核心情绪,4字内","scene":"什么场合会发它,20字内"} '
+    '或 {"meme":false}'
+)
+IMAGE_EXT = {
+    "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
+    "image/gif": ".gif", "image/webp": ".webp", "image/bmp": ".bmp",
+}
+CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 
 # 天气(open-meteo,免费不用 key)和热搜(百度官方)
 GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
@@ -297,6 +318,7 @@ HELP_TEXT = (
     "/提醒列表 /取消提醒 编号\n"
     "/天气 杭州  看天气\n"
     "/热搜      百度实时热搜\n"
+    "/统计      今天这个群聊了多少\n"
     "/表情 [标签]  来张表情包\n"
     "/画 描述   让鲸鲸画一张\n"
     "/搜 问题   联网查\n"
@@ -307,7 +329,7 @@ HELP_TEXT = (
 COMMANDS = {
     "帮助", "help", "菜单", "骰", "骰子", "抽签", "运势", "签到", "打卡", "积分",
     "排行榜", "榜", "猜数字", "猜", "成语接龙", "接龙", "结束", "提醒", "提醒列表",
-    "取消提醒", "天气", "热搜", "禁言", "解除禁言", "全体禁言", "踢", "踢人",
+    "取消提醒", "天气", "热搜", "统计", "禁言", "解除禁言", "全体禁言", "踢", "踢人",
 }
 # 这些不用 @ 机器人也能直接触发(画图/搜索/重置沿用原来的处理)
 BYPASS_COMMANDS = COMMANDS | {"画", "搜", "表情", "重置"}
@@ -417,6 +439,86 @@ class Store:
         return items[:top]
 
 
+class Memory:
+    """轻量长期记忆:按会话把聊天存档,再用关键词捞回来。
+
+    没上向量库(RAG)——那个得额外跑数据库。这里就是存文本 + 两个字两个字地比对,
+    应付「上次说的那个东西」这种指代够用了。
+    """
+
+    def __init__(self, path: Path, keep_days: int = 30) -> None:
+        self.path = path
+        self.keep_days = keep_days
+        self.data: dict[str, list[list[Any]]] = {}
+        self.dirty = False
+        self.last_save = 0.0
+        try:
+            raw = json.loads(path.read_text("utf-8"))
+            if isinstance(raw, dict):
+                self.data = raw
+        except Exception:  # noqa: BLE001
+            self.data = {}
+
+    def add(self, session_key: str, who: str, text: str) -> None:
+        text = text.strip()
+        if not text or len(text) > 200:
+            return
+        rows = self.data.setdefault(session_key, [])
+        rows.append([time.time(), who, text])
+        cutoff = time.time() - self.keep_days * 86400
+        if len(rows) > 2000 or rows[0][0] < cutoff:
+            self.data[session_key] = [r for r in rows if r[0] >= cutoff][-2000:]
+        self.dirty = True
+
+    def search(
+        self, session_key: str, query: str, limit: int = 4, skip_recent: int = 600
+    ) -> list[str]:
+        """找跟这句话有关的旧聊天,返回「谁: 说了啥」。"""
+        rows = self.data.get(session_key) or []
+        grams = {
+            query[i : i + 2]
+            for i in range(len(query) - 1)
+            if CJK_RE.match(query[i]) and CJK_RE.match(query[i + 1])
+        }
+        if not grams:
+            return []
+        # 刚聊完的还在上下文里,不用重复喂
+        cutoff = time.time() - skip_recent
+        scored: list[tuple[int, str]] = []
+        for ts, who, text in rows[-1000:]:
+            if ts > cutoff:
+                continue
+            score = sum(text.count(g) for g in grams)
+            if score:
+                scored.append((score, f"{who}: {text}"))
+        if not scored:
+            return []
+        scored.sort(key=lambda item: -item[0])
+        out: list[str] = []
+        for _, line in scored:
+            if line not in out:
+                out.append(line)
+            if len(out) >= limit:
+                break
+        return out
+
+    def save(self, force: bool = False) -> None:
+        """攒一会儿再写盘,别每条消息都写一次。"""
+        if not self.dirty:
+            return
+        now = time.time()
+        if not force and now - self.last_save < 30:
+            return
+        self.last_save = now
+        self.dirty = False
+        try:
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self.path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("记忆写不进去:%s", exc)
+
+
 def load_config() -> dict[str, Any]:
     if not CONFIG_PATH.exists():
         raise SystemExit(
@@ -459,6 +561,26 @@ class Bot:
         self.repeated: set[str] = set()
         # call_api_wait 等回包用
         self.pending: dict[str, asyncio.Future] = {}
+        # 长期记忆:把聊天存档,以后能捞回来
+        self.memory = Memory(MEMORY_FILE, int(cfg.get("memory_days", 30)))
+        # 群统计 / 日报 / 主动消息
+        self.stats: dict[str, dict[str, Any]] = {}
+        self.day_log: dict[str, list[str]] = defaultdict(list)
+        self.last_active: dict[str, float] = {}
+        self.reported_day = ""
+        self.steal_count: dict[str, Any] = {"day": "", "n": 0}
+        self.known_hashes: set[str] = self._hash_stickers()
+
+    def _hash_stickers(self) -> set[str]:
+        """给库里已有的表情包算指纹,免得偷回来一堆重复的。"""
+        out = set()
+        for item in self.stickers:
+            path = STICKER_DIR / item["file"]
+            try:
+                out.add(hashlib.md5(path.read_bytes()).hexdigest())
+            except Exception:  # noqa: BLE001
+                continue
+        return out
 
     # ---------- 表情包 ----------
 
@@ -748,6 +870,12 @@ class Bot:
             system_prompt += STICKER_HINT.format(items=self.sticker_list_text())
         if self.ambient.get(session_key):
             system_prompt += AMBIENT_TPL.format(chat="\n".join(self.ambient[session_key]))
+        # 以前的聊天里有没有相关的,捞出来提一句(轻量长期记忆)
+        recalled = self.memory.search(
+            session_key, user_text, int(self.cfg.get("memory_recall", 4))
+        )
+        if recalled:
+            system_prompt += MEMORY_TPL.format(items="\n".join(recalled))
         messages.append({"role": "system", "content": system_prompt})
         messages.extend(history[-max_history:])
         messages.append({"role": "user", "content": current})
@@ -1165,6 +1293,9 @@ class Bot:
         # 所以图片消息就算没点它,也先记下来,供后面几条消息用。
         if images:
             self.recent_images[session_key] = (time.time(), images)
+            # 群里别人发的表情包,顺手收了(白名单外的图会被拒)
+            if is_group:
+                asyncio.create_task(self.steal_stickers(images, event))
 
         # 防撤回:先把这条原文记下来,因为撤回事件里只有一个 message_id
         if is_group and text:
@@ -1176,6 +1307,8 @@ class Bot:
                     text[:200],
                 )
             )
+            # 统计、日报素材、冷场计时、长期记忆都记在这一笔里
+            self.track_group(session_key, speaker, text)
 
         # 命令不用 @ 机器人也能用;成语接龙进行中,直接发四个字也算接龙
         playing_idiom = self.games.get(session_key, {}).get("kind") == "idiom"
@@ -1319,7 +1452,8 @@ class Bot:
             log.info("表情包:%s(%s)", sticker.name if sticker else "不发", sticker_tag or "-")
 
             if answer:
-                await self.reply(event, answer)
+                # 长回复拆成几条发,第一条引用对方,看着更像真人
+                await self.send_answer(event, answer)
             if sticker:
                 await self.send_sticker(event, sticker)
                 self.remember_sticker(session_key, sticker.name)
@@ -1744,6 +1878,8 @@ class Bot:
             await self.reply(event, await self.fetch_weather(rest))
         elif head == "热搜":
             await self.reply(event, await self.fetch_hot())
+        elif head == "统计":
+            await self.reply(event, self.stats_text(session_key))
         elif head in ("禁言", "解除禁言", "全体禁言", "踢", "踢人"):
             await self.reply(event, await self.do_admin(event, head, rest, is_group))
         return True
@@ -1770,6 +1906,239 @@ class Bot:
             return
         log.info("跟着复读一句:%s", body)
         await self.reply(event, body)
+
+    # ---------- 说话方式:分段、引用 ----------
+
+    def split_reply(self, text: str) -> list[str]:
+        """把长回复拆成几条短的,像真人那样一条条发,而不是糊一大块。"""
+        body = text.strip()
+        if not self.cfg.get("split_reply", True) or len(body) < 24:
+            return [text]
+        limit = max(1, int(self.cfg.get("split_max", 3)))
+        if limit == 1:
+            return [text]
+        parts = [p.strip() for p in re.split(r"\n+", body) if p.strip()]
+        if len(parts) < 2:
+            parts = [p.strip() for p in re.split(r"(?<=[。！？!?~…])\s*", body) if p.strip()]
+        if len(parts) < 2:
+            return [text]
+        # 一句只有两三个字的,跟前面那条并起来,不然像挤牙膏
+        merged: list[str] = []
+        for part in parts:
+            if merged and len(part) <= 4:
+                merged[-1] += part
+            else:
+                merged.append(part)
+        while len(merged) > limit:
+            merged[-2] += merged[-1]
+            merged.pop()
+        return [p for p in merged if p.strip()]
+
+    def as_segments(self, event: dict[str, Any], text: str, quote: bool = False) -> Any:
+        """要引用原消息就拼成消息段,不然直接发纯文本。"""
+        if not (quote and self.cfg.get("quote_reply", True) and event.get("message_id")):
+            return text
+        return [
+            {"type": "reply", "data": {"id": str(event["message_id"])}},
+            {"type": "text", "data": {"text": text}},
+        ]
+
+    async def send_answer(self, event: dict[str, Any], text: str) -> None:
+        """聊天回复:分段发,第一条引用对方。"""
+        chunks = self.split_reply(text)
+        for i, chunk in enumerate(chunks):
+            await self.send(event, self.as_segments(event, chunk, quote=(i == 0)))
+            if i < len(chunks) - 1:
+                await asyncio.sleep(float(self.cfg.get("split_delay", 0.8)))
+
+    # ---------- 群统计 / 日报 / 主动消息 ----------
+
+    def track_group(self, session_key: str, speaker: str, text: str) -> None:
+        """记一笔群消息:统计、日报素材、冷场计时、长期记忆都靠它。"""
+        today = datetime.now().strftime("%Y-%m-%d")
+        stat = self.stats.get(session_key)
+        if not stat or stat.get("day") != today:
+            stat = {"day": today, "count": 0, "users": {}, "hours": {}}
+            self.stats[session_key] = stat
+            self.day_log[session_key] = []
+        stat["count"] += 1
+        who = speaker or "某人"
+        stat["users"][who] = stat["users"].get(who, 0) + 1
+        hour = str(datetime.now().hour)
+        stat["hours"][hour] = stat["hours"].get(hour, 0) + 1
+        if text and len(self.day_log[session_key]) < 400:
+            self.day_log[session_key].append(f"{who}: {text[:80]}")
+        self.last_active[session_key] = time.time()
+        self.memory.add(session_key, who, text)
+
+    def stats_text(self, session_key: str) -> str:
+        stat = self.stats.get(session_key) or {}
+        if not stat.get("count"):
+            return "今天这个群还没聊几句,没统计到啥"
+        users = sorted(stat.get("users", {}).items(), key=lambda kv: -kv[1])[:3]
+        hours = stat.get("hours", {})
+        busiest = max(hours.items(), key=lambda kv: kv[1])[0] if hours else "?"
+        top = "、".join(f"{name}({n})" for name, n in users)
+        return (
+            f"今天这个群聊了 {stat['count']} 条\n"
+            f"最活跃:{top}\n"
+            f"最热闹的时段:{busiest} 点\n"
+            f"今天偷到 {self.steal_count.get('n', 0)} 张表情包"
+        )
+
+    async def summarize_day(self, session_key: str) -> str:
+        lines = self.day_log.get(session_key) or []
+        prompt = (
+            "下面是今天群里的聊天记录,格式是「昵称: 内容」。写一份群聊日报:\n"
+            "1. 第一行用一句话说今天群里主要在聊什么;\n"
+            "2. 再列 2-4 条今天的话题或名场面,每条一行、一句话;\n"
+            "3. 最后点一下今天最活跃的人。\n"
+            "中文,总共 150 字以内,口语,不要 Markdown 标题和表格,不要客套开场。\n\n"
+            + "\n".join(lines[-200:])
+        )
+        return await self.ask_plain(prompt, max_tokens=400)
+
+    async def maybe_daily_report(self) -> None:
+        """到点了给每个有聊天的群发一份日报。"""
+        if not self.cfg.get("daily_report", True):
+            return
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        if now.strftime("%H:%M") < str(self.cfg.get("report_time", "21:00")):
+            return
+        if self.reported_day == today:
+            return
+        self.reported_day = today
+        need = int(self.cfg.get("report_min_messages", 30))
+        for key in list(self.day_log):
+            if not key.startswith("group_"):
+                continue
+            if len(self.day_log[key]) < need:
+                continue
+            text = await self.summarize_day(key)
+            if not text:
+                continue
+            log.info("发群聊日报:%s", key)
+            await self.send(
+                {"message_type": "group", "group_id": key.split("_", 1)[1]},
+                f"今天的群聊日报:\n{text}",
+            )
+
+    async def proactive_line(self, session_key: str) -> str:
+        chat = "\n".join(self.ambient.get(session_key, [])[-8:])
+        prompt = (
+            f"{self.cfg.get('system_prompt') or ''}\n\n"
+            f"群里刚才聊的是:\n{chat}\n\n"
+            "现在群里安静了一阵子,你想主动冒个泡。要求:一句中文,20 字以内,"
+            "口语自然,可以接刚才的话头、也可以随口抛个问题,不 @ 任何人,"
+            "不客套、不说自己是 AI。只输出这一句话。"
+        )
+        return (await self.ask_plain(prompt, max_tokens=60)).strip()
+
+    async def maybe_speak(self) -> None:
+        """冷场时主动说一句。"""
+        if not self.cfg.get("proactive", True):
+            return
+        hour = datetime.now().hour
+        quiet = self.cfg.get("quiet_hours") or [23, 8]
+        start, end = int(quiet[0]), int(quiet[1])
+        if (start > end and (hour >= start or hour < end)) or (
+            start <= end and start <= hour < end
+        ):
+            return
+        idle = float(self.cfg.get("proactive_idle_minutes", 45)) * 60
+        need = int(self.cfg.get("proactive_min_messages", 6))
+        now = time.time()
+        for key, last in list(self.last_active.items()):
+            if not key.startswith("group_") or now - last < idle:
+                continue
+            if (self.stats.get(key) or {}).get("count", 0) < need:
+                continue
+            if random.random() > float(self.cfg.get("proactive_chance", 0.35)):
+                continue
+            self.last_active[key] = now  # 冒过泡就重新计时,别连着蹦出来
+            line = await self.proactive_line(key)
+            if not line:
+                continue
+            log.info("主动冒个泡:%s", line)
+            await self.send(
+                {"message_type": "group", "group_id": key.split("_", 1)[1]}, line
+            )
+            return
+
+    async def proactive_loop(self) -> None:
+        """每 40 秒看一眼:该发日报了没、该冒泡了没。"""
+        while True:
+            await asyncio.sleep(40)
+            try:
+                await self.maybe_daily_report()
+                await self.maybe_speak()
+                self.memory.save()
+            except Exception:  # noqa: BLE001
+                log.exception("主动消息/日报出错")
+
+    # ---------- 偷表情包 ----------
+
+    async def steal_stickers(self, images: list[str], event: dict[str, Any]) -> None:
+        """群里别人发的表情包,顺手收进自己库里。"""
+        if not self.cfg.get("steal_stickers", True):
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self.steal_count.get("day") != today:
+            self.steal_count = {"day": today, "n": 0}
+        limit = int(self.cfg.get("steal_max_per_day", 8))
+        for ref in images[:2]:
+            if self.steal_count["n"] >= limit:
+                return
+            raw = await self._fetch_image_bytes(ref)
+            if not raw or len(raw) < 5000:  # 太小的多半是缩略图
+                continue
+            digest = hashlib.md5(raw).hexdigest()
+            if digest in self.known_hashes:
+                continue
+            kind = str(
+                mimetypes.guess_type(ref.split("?")[0])[0] or "image/jpeg"
+            ).lower()
+            ext = IMAGE_EXT.get(kind, ".jpg")
+            data_url = f"data:{kind};base64,{base64.b64encode(raw).decode()}"
+            verdict = await self.ask_vision(STEAL_PROMPT, data_url)
+            start, end = verdict.find("{"), verdict.rfind("}")
+            try:
+                info = json.loads(verdict[start : end + 1])
+            except Exception:  # noqa: BLE001
+                continue
+            if not info.get("meme"):
+                continue
+            name = f"偷来的_{digest[:6]}{ext}"
+            target = STICKER_DIR / name
+            try:
+                STICKER_DIR.mkdir(exist_ok=True)
+                target.write_bytes(raw)
+                item = {
+                    "file": name,
+                    "emotion": str(info.get("emotion") or "无语")[:8],
+                    "scene": str(info.get("scene") or "")[:40],
+                    "tags": [str(t)[:8] for t in (info.get("tags") or [])][:5],
+                }
+                self._append_sticker_index(item)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("偷表情包没存住:%s", exc)
+                continue
+            self.stickers.append(item)
+            self.known_hashes.add(digest)
+            self.steal_count["n"] += 1
+            log.info("偷到一张表情包:%s(%s)", name, item["emotion"])
+
+    def _append_sticker_index(self, item: dict[str, Any]) -> None:
+        """把新表情包写进 tags.json(读不出来的话就丢一张,别把库弄坏)。"""
+        try:
+            data = json.loads(STICKER_INDEX.read_text("utf-8"))
+        except Exception:  # noqa: BLE001
+            return
+        data.setdefault("images", []).append(item)
+        STICKER_INDEX.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
 
     # ---------- 通知事件 ----------
 
@@ -1826,6 +2195,7 @@ class Bot:
 
         asyncio.create_task(self.watch_stale())
         asyncio.create_task(self.reminder_loop())
+        asyncio.create_task(self.proactive_loop())
         tries = 0
         while True:
             try:

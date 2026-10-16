@@ -146,5 +146,24 @@
   "repeat_min": 3,
   "repeat_chance": 0.7,
   "admin_cmds": true,
-  "admin_users": []
+  "admin_users": [],
+  "split_reply": true,
+  "split_max": 3,
+  "split_delay": 0.8,
+  "quote_reply": true,
+  "memory_days": 30,
+  "memory_recall": 4,
+  "proactive": true,
+  "proactive_idle_minutes": 45,
+  "proactive_chance": 0.35,
+  "proactive_min_messages": 6,
+  "quiet_hours": [
+    23,
+    8
+  ],
+  "steal_stickers": true,
+  "steal_max_per_day": 8,
+  "daily_report": true,
+  "report_time": "21:00",
+  "report_min_messages": 30
 }

@@ -11,6 +11,7 @@ __pycache__/
 二维码.png
 bot.lock
 data.json
+memory.json
 
 # 本地测试用的对比图
 _compare/
