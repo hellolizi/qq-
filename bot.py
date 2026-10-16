@@ -491,6 +491,11 @@ NATURAL_STOP = ("余额宝", "支付宝", "微信", "银行卡")
 KICK_RE = re.compile(r"(?:把|将|给)[^，。!？?\s]{0,12}?[踢Tt]|[踢Tt](?:出去|掉|走|了)")
 # 但在聊踢球的群里,「把球踢飞了」也是这个句式,别误认
 KICK_STOP = ("踢球", "足球", "踢毽", "踢腿", "踢踏", "踢飞", "球踢")
+# 问「你会啥」的时候得答,不能只认「帮助」「菜单」那两个字
+HELP_WORDS = (
+    "命令", "会啥", "会什么", "会做什么", "能干啥", "能干嘛", "能做什么",
+    "什么功能", "有啥功能", "哪些功能", "帮助", "菜单",
+)
 
 
 def natural_command(text: str) -> str:
@@ -502,6 +507,8 @@ def natural_command(text: str) -> str:
         return ""
     if KICK_RE.search(body) and not any(w in body for w in KICK_STOP):
         return "踢"
+    if any(w in body for w in HELP_WORDS):
+        return "帮助"
     for kw, cmd in NATURAL_CMDS:
         if kw in body:
             return cmd
