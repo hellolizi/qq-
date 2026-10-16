@@ -1266,6 +1266,7 @@ class Bot:
         # 模型要调工具:本地把工具跑了,把结果塞回去让它接着说话。
         # 最多两跳,防它一直调工具转圈。
         hops = 0
+        tool_notes: list[str] = []
         while msg.get("tool_calls") and hops < 2:
             hops += 1
             messages.append(
@@ -1286,6 +1287,7 @@ class Bot:
                 name = str(fn.get("name") or "")
                 result = await self.run_tool(name, targs, session_key)
                 log.info("模型调工具 %s → %s", name, result[:60].replace("\n", " "))
+                tool_notes.append(f"{name} 得到: {result.strip()[:120]}")
                 messages.append(
                     {
                         "role": "tool",
@@ -1315,6 +1317,11 @@ class Bot:
                 stored = "[已发图]"
             stored, _ = split_image_marker(stored)
             stored, _ = split_sticker_marker(stored)
+        if tool_notes:
+            # 刚查到的结果也记进上下文,不然下一轮追问「那刚才那个数呢」它会断片
+            history.append(
+                {"role": "assistant", "content": "(我查了 " + "; ".join(tool_notes) + ")"}
+            )
         history.append({"role": "assistant", "content": stored})
         # 只保留最近 max_history 条,防止上下文无限增长
         if len(history) > max_history:
