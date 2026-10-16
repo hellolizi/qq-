@@ -1,5 +1,8 @@
 # 本地配置(含 API Key、机器人 QQ 号,绝不外传)
 config.json
+# 连变体一起挡掉:手滑存了 config.local.json / config备份.json 也别想传上去
+config*.json
+!config.example.json
 
 # 第三方程序本体,体积大,自己下载就行
 NapCat/
