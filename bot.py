@@ -21,6 +21,7 @@ import mimetypes
 import os
 import random
 import re
+import shutil
 import sys
 import time
 from collections import defaultdict, deque
@@ -319,6 +320,7 @@ HELP_TEXT = (
     "/天气 杭州  看天气\n"
     "/热搜      百度实时热搜\n"
     "/统计      今天这个群聊了多少\n"
+    "/余额      看鲸鲸还剩多少额度\n"
     "/表情 [标签]  来张表情包\n"
     "/画 描述   让鲸鲸画一张\n"
     "/搜 问题   联网查\n"
@@ -329,7 +331,8 @@ HELP_TEXT = (
 COMMANDS = {
     "帮助", "help", "菜单", "骰", "骰子", "抽签", "运势", "签到", "打卡", "积分",
     "排行榜", "榜", "猜数字", "猜", "成语接龙", "接龙", "结束", "提醒", "提醒列表",
-    "取消提醒", "天气", "热搜", "统计", "禁言", "解除禁言", "全体禁言", "踢", "踢人",
+    "取消提醒", "天气", "热搜", "统计", "余额", "额度", "禁言", "解除禁言", "全体禁言",
+    "踢", "踢人",
 }
 # 这些不用 @ 机器人也能直接触发(画图/搜索/重置沿用原来的处理)
 BYPASS_COMMANDS = COMMANDS | {"画", "搜", "表情", "重置"}
@@ -337,8 +340,17 @@ BYPASS_COMMANDS = COMMANDS | {"画", "搜", "表情", "重置"}
 # 不带 / 也能用的命令(比如直接说"签到")
 KEYWORDS = {
     "签到": "/签到", "打卡": "/签到", "运势": "/运势", "抽签": "/抽签",
-    "热搜": "/热搜", "帮助": "/帮助", "菜单": "/帮助",
+    "热搜": "/热搜", "帮助": "/帮助", "菜单": "/帮助", "余额": "/余额", "额度": "/余额",
 }
+
+
+def find_bl() -> str | None:
+    """找阿里云百炼的命令行工具 bl。PATH 里没有就去默认安装位置翻。"""
+    found = shutil.which("bl")
+    if found:
+        return found
+    guess = Path(os.environ.get("LOCALAPPDATA") or "") / "bailian-cli" / "bin" / "bl.exe"
+    return str(guess) if guess.exists() else None
 
 
 def strip_when(text: str) -> str:
@@ -1752,6 +1764,78 @@ class Bot:
         ]
         return "百度实时热搜:\n" + "\n".join(lines)
 
+    # --- 额度:查阿里云百炼的免费额度 ---
+
+    def balance_models(self) -> list[str]:
+        """报额度时报哪几个模型,就是机器人自己在用的那几个。"""
+        out: list[str] = []
+        for key in ("model", "vision_model", "search_model", "image_model", "draw_prompt_model"):
+            name = str(self.cfg.get(key) or "").strip()
+            if name and name not in out:
+                out.append(name)
+        return out
+
+    @staticmethod
+    def short_num(value: Any) -> str:
+        """610488 写成 61.0万,省得刷屏。"""
+        try:
+            num = float(value)
+        except (TypeError, ValueError):
+            return "?"
+        return f"{num / 10000:.1f}万" if num >= 10000 else f"{num:.0f}"
+
+    def balance_text(self, rows: list[dict[str, Any]]) -> str:
+        """把 bl usage free 的结果写成一小段人话。"""
+        by_model = {str(r.get("model")): r for r in rows if isinstance(r, dict)}
+        lines, used = [], []
+        for name in self.balance_models():
+            row = by_model.get(name)
+            if not row:
+                lines.append(f"· {name}: 没查到(这个模型不送免费额度,或者已经用完)")
+                continue
+            used.append(row)
+            pct = row.get("remainingPercent")
+            pct = f"{float(pct):.0f}%" if pct is not None else "?"
+            lines.append(
+                f"· {name}: 剩 {self.short_num(row.get('remaining'))}"
+                f" / {self.short_num(row.get('total'))}({pct})"
+            )
+        expires = [str(r.get("expires")) for r in used if r.get("expires")]
+        tail = f"\n最早到期:{min(expires)}" if expires else ""
+        return "鲸鲸的白饭还剩这些(阿里云免费额度):\n" + "\n".join(lines) + tail
+
+    async def fetch_balance(self) -> str:
+        """跑一次 bl usage free,问阿里云还剩多少额度。"""
+        exe = find_bl()
+        if not exe:
+            return "我这边没找到阿里云百炼的命令行工具(bl),装上才能查额度"
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                exe,
+                "usage",
+                "free",
+                "--output",
+                "json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=25)
+        except asyncio.TimeoutError:
+            return "查额度超时了,过会儿再喊我"
+        except Exception as exc:  # noqa: BLE001
+            return f"查额度失败了({exc})"
+        text = out.decode("utf-8-sig", "replace").strip()
+        try:
+            rows = json.loads(text)
+        except ValueError:
+            return f"查额度没成功,可能要重新登录一次(bl auth login --console)\n{text[:80]}"
+        if isinstance(rows, dict):
+            msg = str((rows.get("error") or {}).get("message") or text[:80])
+            return f"查额度没成功:{msg}\n重新登录一次就好了:bl auth login --console"
+        if not isinstance(rows, list) or not rows:
+            return "没查到免费额度"
+        return self.balance_text(rows)
+
     # --- 群管:禁言 / 踢人 ---
 
     async def do_admin(
@@ -1880,6 +1964,8 @@ class Bot:
             await self.reply(event, await self.fetch_hot())
         elif head == "统计":
             await self.reply(event, self.stats_text(session_key))
+        elif head == "余额":
+            await self.reply(event, await self.fetch_balance())
         elif head in ("禁言", "解除禁言", "全体禁言", "踢", "踢人"):
             await self.reply(event, await self.do_admin(event, head, rest, is_group))
         return True
