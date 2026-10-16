@@ -117,6 +117,71 @@ ROUTING_HINT = (
 )
 
 
+# 文字聊天给模型挂的工具。她不用谁打斜杠命令 —— 想查什么自己决定要不要调。
+# 只挂在这条主聊天上;日报、冒泡、偷表情包那些内部小调用不带,省 token。
+# 注意:踢人 / 禁言这种拉不回来的动作永远不在这里,那条只走硬规则。
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "check_balance",
+            "description": "查这个号还剩多少钱、多少免费额度",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "查某地现在的天气。不给城市就用默认城市",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string", "description": "城市名,比如 杭州"}
+                },
+                "required": [],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_hot",
+            "description": "看百度实时热搜榜",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "group_stats",
+            "description": "看本群今天聊了多少条、谁最活跃",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "联网查最新的、或者你不知道的事",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "要查的问题"}},
+                "required": ["query"],
+            },
+        },
+    },
+]
+
+# 挂了工具时补一句,让她知道这些能自己办,别嘴上说「我查不了」
+NATURAL_HINT = (
+    "\n\n【你自己的本事(需要时直接调工具拿结果,别嘴上说「我查不了」)】\n"
+    "查钱/额度→check_balance;查天气→get_weather;看热搜→get_hot;"
+    "看本群今天活跃度→group_stats;要最新或你自己拿不准的事→web_search。\n"
+    "拿到结果以后用你自己的口气说一两句,别把原始结果原样复述一遍。\n"
+)
+
+
 def split_image_marker(text: str) -> tuple[str, str]:
     """拆出模型附在结尾的配图指令 `[IMG] 关键词`,返回(去掉指令的正文, 关键词)。"""
     match = re.search(r"`?\[IMG\][ \t]*`?([^`\n]*)`?", text)
@@ -1074,6 +1139,7 @@ class Bot:
         user_text: str,
         images: list[str] | None = None,
         use_search: bool = False,
+        tools: bool = False,
         speaker: str = "",
     ) -> str:
         history = self.history[session_key]
@@ -1104,6 +1170,9 @@ class Bot:
         messages: list[dict[str, Any]] = []
         # 人设归 config,画图 / 搜索这些技术约定由代码追加,改人设不会把功能改坏
         system_prompt = (self.cfg.get("system_prompt") or "") + ROUTING_HINT
+        # 挂工具时补一句「你会什么」;带图 / 联网那条路不挂工具,就别说
+        if tools and not images and not use_search:
+            system_prompt += NATURAL_HINT
         if use_search and not images:
             system_prompt += SEARCH_HINT
         if self.stickers and not images:
@@ -1155,6 +1224,10 @@ class Bot:
         for key in ("temperature", "top_p"):
             if key in self.cfg:
                 payload[key] = self.cfg[key]
+        # 带图、联网这两条路不挂工具:一条走视觉模型、一条本来就在搜
+        attach_tools = tools and not images and not use_search
+        if attach_tools:
+            payload["tools"] = TOOLS
         if on_official:
             # 官网的思考模式默认就是开的,群里聊天要快,明确关掉;
             # 它也不认百炼那套 enable_thinking / enable_search,所以只发它认的参数
@@ -1182,9 +1255,44 @@ class Bot:
             log.error("模型返回 %s: %s", resp.status_code, resp.text[:300])
             raise RuntimeError(f"模型接口错误 {resp.status_code}")
 
-        content = strip_self_prefix(
-            (resp.json()["choices"][0]["message"].get("content") or "").strip(), (speaker,)
-        )
+        msg = resp.json()["choices"][0]["message"]
+        # 模型要调工具:本地把工具跑了,把结果塞回去让它接着说话。
+        # 最多两跳,防它一直调工具转圈。
+        hops = 0
+        while msg.get("tool_calls") and hops < 2:
+            hops += 1
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": msg.get("content") or "",
+                    "tool_calls": msg["tool_calls"],
+                }
+            )
+            for call in msg["tool_calls"]:
+                fn = call.get("function") or {}
+                try:
+                    targs = json.loads(fn.get("arguments") or "{}")
+                except (ValueError, TypeError):
+                    targs = {}
+                if not isinstance(targs, dict):
+                    targs = {}
+                name = str(fn.get("name") or "")
+                result = await self.run_tool(name, targs, session_key)
+                log.info("模型调工具 %s → %s", name, result[:60].replace("\n", " "))
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": call.get("id") or "",
+                        "content": result,
+                    }
+                )
+            resp = await self.http.post(url, json=payload, headers=headers)
+            if resp.status_code != 200:
+                log.error("工具回环后返回 %s: %s", resp.status_code, resp.text[:300])
+                raise RuntimeError(f"模型接口错误 {resp.status_code}")
+            msg = resp.json()["choices"][0]["message"]
+
+        content = strip_self_prefix((msg.get("content") or "").strip(), (speaker,))
 
         # 上下文里只留纯文字,避免每轮重传整张图
         history.append(
@@ -1205,6 +1313,60 @@ class Bot:
         if len(history) > max_history:
             del history[:-max_history]
         return content
+
+    async def run_tool(self, name: str, args: dict[str, Any], session_key: str) -> str:
+        """模型点名要调的工具,就在本地把它跑了,结果原样还回去让它接着说话。
+
+        这里只放「查一下」这种良性操作。踢人 / 禁言不在这,那走硬规则。
+        """
+        try:
+            if name == "check_balance":
+                return await self.fetch_balance()
+            if name == "get_weather":
+                city = str((args or {}).get("city") or "").strip()
+                return await self.fetch_weather(city)
+            if name == "get_hot":
+                return await self.fetch_hot()
+            if name == "group_stats":
+                return self.stats_text(session_key)
+            if name == "web_search":
+                query = str((args or {}).get("query") or "").strip()
+                if not query:
+                    return "没给要查的内容"
+                return await self.tool_web_search(query)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("工具 %s 执行失败:%s", name, exc)
+            return f"这个我这边没跑成({name})"
+        log.warning("模型要调不存在的工具:%s", name)
+        return f"没有 {name} 这么个东西"
+
+    async def tool_web_search(self, query: str) -> str:
+        """给模型当工具用的联网搜索。走百炼那边的搜索模型(官网搜不了)。"""
+        url = self.cfg.get("deepseek_base_url", "").rstrip("/") + "/chat/completions"
+        model = str(self.cfg.get("search_model") or self.cfg.get("model", ""))
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": query}],
+            "stream": False,
+            "max_tokens": int(self.cfg.get("max_tokens", 400)),
+            "enable_search": True,
+        }
+        # 百炼的 DeepSeek 不关思考会烧成空白正文,老坑
+        if is_deepseek(model):
+            payload["enable_thinking"] = False
+        headers = {
+            "Authorization": f"Bearer {self.cfg['deepseek_api_key']}",
+            "Content-Type": "application/json",
+        }
+        try:
+            resp = await self.http.post(url, json=payload, headers=headers, timeout=60)
+            if resp.status_code != 200:
+                return f"没搜到(接口 {resp.status_code})"
+            text = (resp.json()["choices"][0]["message"].get("content") or "").strip()
+            return text or "没搜到相关的东西"
+        except Exception as exc:  # noqa: BLE001
+            log.warning("工具联网搜索失败:%s", exc)
+            return f"搜索没连上({exc})"
 
     async def ask_plain(self, prompt: str, max_tokens: int = 80) -> str:
         """问模型一句话,不进对话历史(小游戏判定这种用完就丢的场合用)。"""
@@ -1728,6 +1890,7 @@ class Bot:
                     ask_text,
                     images=images,
                     use_search=use_search,
+                    tools=not use_search,
                     speaker=speaker,
                 )
             except Exception:  # noqa: BLE001

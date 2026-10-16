@@ -185,7 +185,7 @@
   "steal_stickers": true,
   "steal_max_per_day": 8,
   "daily_report": true,
-  "report_time": "21:00",
+  "report_time": "23:00",
   "report_min_messages": 30,
   "steal_min_seen": 2,
   "sulk_after": 5,
