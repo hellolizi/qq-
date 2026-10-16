@@ -10,6 +10,8 @@
   "chat_api_key": "",
   "chat_model": "deepseek-flash",
   "chat_thinking": false,
+  "aliyun_access_key_id": "",
+  "aliyun_access_key_secret": "",
   "max_tokens": 400,
   "reply_max_tokens": 120,
   "search_model": "qwen3.8-flash",

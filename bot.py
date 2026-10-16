@@ -14,6 +14,7 @@ import asyncio
 import base64
 import ctypes
 import hashlib
+import hmac
 import html
 import json
 import logging
@@ -24,11 +25,12 @@ import re
 import shutil
 import sys
 import time
+import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 import websockets
@@ -190,6 +192,20 @@ DS_OFFICIAL_PRICE = {
     "deepseek-v4-flash": (1, 2),
     "deepseek-v4-pro": (3, 6),
 }
+
+# 阿里云的优惠券(学生那 300 元就在这)。它是账户级卡券,百炼那套接口看不到,
+# 得走费用与成本 OpenAPI,而且要一对 AccessKey。签名是老的 RPC 规矩,自己算免得再装 CLI。
+BSS_HOST = "https://business.aliyuncs.com/"
+BSS_VERSION = "2023-09-30"
+
+
+def _bss_sign(params: dict[str, str], secret: str) -> str:
+    """阿里云 RPC 签名:参数按 key 排序拼串,再 HMAC-SHA1 + base64。"""
+    enc = lambda s: quote(str(s), safe="~")  # noqa: E731
+    canon = "&".join(f"{enc(k)}={enc(params[k])}" for k in sorted(params))
+    to_sign = f"GET&{enc('/')}&{enc(canon)}"
+    digest = hmac.new((secret + "&").encode(), to_sign.encode(), hashlib.sha1).digest()
+    return base64.b64encode(digest).decode()
 
 # 成语接龙判定:让模型看真假和接得上接不上,顺手给出下一句
 IDIOM_CHECK_TPL = (
@@ -2134,15 +2150,74 @@ class Bot:
             return "【阿里云百炼】\n没查到免费额度"
         return self.balance_text(rows)
 
+    async def fetch_coupon_balance(self) -> str:
+        """问阿里云费用中心还剩多少优惠券(学生那 300 元就在这)。
+
+        百炼的接口看不到它——优惠券是账户级的东西,要走费用与成本 OpenAPI,
+        签名是老的 RPC 规矩,所以得自己算,别指望 bl 帮忙。
+        """
+        ak = str(self.cfg.get("aliyun_access_key_id") or "").strip()
+        sk = str(self.cfg.get("aliyun_access_key_secret") or "").strip()
+        if not (ak and sk):
+            return ""
+        params = {
+            "Action": "DescribeCoupon",
+            "Version": BSS_VERSION,
+            "Format": "JSON",
+            "AccessKeyId": ak,
+            "SignatureMethod": "HMAC-SHA1",
+            "SignatureVersion": "1.0",
+            "Timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "SignatureNonce": str(uuid.uuid4()),
+            "CurrentPage": "1",
+            "PageSize": "50",
+        }
+        params["Signature"] = _bss_sign(params, sk)
+        try:
+            resp = await self.http.get(BSS_HOST, params=params)
+            data = resp.json()
+        except Exception as exc:  # noqa: BLE001
+            log.warning("查阿里云优惠券失败: %s", exc)
+            return "【阿里云优惠券】\n没查到(连不上)"
+        if resp.status_code != 200 or data.get("Code"):
+            msg = str(data.get("Message") or f"HTTP {resp.status_code}")
+            return f"【阿里云优惠券】\n没查到:{msg}"
+        live = [
+            c
+            for c in (data.get("Data") or [])
+            if str(c.get("Status") or "").lower().startswith("available")
+        ]
+        if not live:
+            return "【阿里云优惠券】\n没有可用的券了(要么用完了,要么过期了)"
+        lines: list[str] = []
+        total = 0.0
+        sym = "¥"
+        for c in live:
+            try:
+                rem = float(c.get("RemainAmount") or 0)
+            except (TypeError, ValueError):
+                rem = 0.0
+            total += rem
+            name = str(c.get("CouponTypeName") or c.get("CouponType") or "优惠券")
+            cur = str(c.get("Currency") or "CNY").upper()
+            sym = {"CNY": "¥", "USD": "$"}.get(cur, cur + " ")
+            end = str(c.get("EndTime") or "")[:10]
+            note = f",{end} 到期" if end else ""
+            lines.append(f"· {name}: 剩 {sym}{rem:.2f}{note}")
+        head = f"【阿里云优惠券 · 学生权益】一共还剩 {sym}{total:.2f}"
+        return head + "\n" + "\n".join(lines)
+
     async def fetch_balance(self) -> str:
-        """两个地方都问一遍:DeepSeek 官网剩多少钱 + 阿里云还剩多少额度。"""
-        ds, ali = await asyncio.gather(
-            self.fetch_ds_balance(), self.fetch_aliyun_balance()
+        """三个地方都问一遍:DeepSeek 官网余额 + 阿里云优惠券 + 百炼免费额度。"""
+        ds, coupon, ali = await asyncio.gather(
+            self.fetch_ds_balance(),
+            self.fetch_coupon_balance(),
+            self.fetch_aliyun_balance(),
         )
-        parts = [p for p in (ds, ali) if p]
+        parts = [p for p in (ds, coupon, ali) if p]
         if not parts:
-            return "没查到余额,两边的 key 可能都没配上"
-        return "鲸鲸的两份饭:\n\n" + "\n\n".join(parts)
+            return "没查到余额,几个 key 可能都没配上"
+        return "鲸鲸的白饭账本:\n\n" + "\n\n".join(parts)
 
     # --- 群管:禁言 / 踢人 ---
 
