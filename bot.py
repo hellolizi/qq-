@@ -1007,8 +1007,6 @@ class Bot:
     async def send(self, event: dict[str, Any], message: Any) -> None:
         """发送消息。message 可以是纯文本,也可以是 OneBot 消息段列表。"""
         if event.get("message_type") == "group":
-            # 记下她刚说了话,给「接话窗」用
-            self.last_bot_speak[f"group_{event['group_id']}"] = time.time()
             await self.call_api(
                 "send_group_msg",
                 {"group_id": event["group_id"], "message": message},
@@ -1021,6 +1019,12 @@ class Bot:
 
     async def reply(self, event: dict[str, Any], text: str) -> None:
         await self.send(event, text)
+
+    async def open_chat_window(self, event: dict[str, Any], session_key: str) -> None:
+        """她刚跟人聊完,给这一小会儿开个「接话窗」,别人接着说的短句没 @ 也理。
+        只有主聊天/应答才开;日报、主动冒泡、偷表情包这种自己冒出来的不算。"""
+        if event.get("message_type") == "group":
+            self.last_bot_speak[session_key] = time.time()
 
     async def send_sticker(self, event: dict[str, Any], path: Path) -> None:
         """把本地表情包当图片发出去。"""
@@ -1779,6 +1783,10 @@ class Bot:
             return
         if event.get("self_id"):
             self.self_id = str(event["self_id"])
+        # 别理自己发的消息:有的 NapCat 会把她自己发的话也推回来,
+        # 不挡住她会自问自答(尤其刚加的接话窗,会自己接自己的话)
+        if self.self_id and str(event.get("user_id") or "") == self.self_id:
+            return
 
         text, at_bot, images = self.parse_message(event)
         is_group = event.get("message_type") == "group"
@@ -1841,6 +1849,7 @@ class Bot:
                 if str(x).strip()
             ]
             await self.reply(event, random.choice(lines) if lines else "怎么了？")
+            await self.open_chat_window(event, session_key)
             return
 
         if ask_text is None:
@@ -1852,6 +1861,7 @@ class Bot:
                     if str(x).strip()
                 ]
                 await self.reply(event, random.choice(lines) if lines else "怎么了？")
+                await self.open_chat_window(event, session_key)
                 return
             # 没点它的话也听着,顺带该复读就复读
             self.remember_ambient(session_key, speaker, text, bool(images))
@@ -2009,6 +2019,7 @@ class Bot:
             if answer:
                 # 长回复拆成几条发,第一条引用对方,看着更像真人
                 await self.send_answer(event, answer)
+                await self.open_chat_window(event, session_key)
             if sticker:
                 await self.send_sticker(event, sticker)
                 self.remember_sticker(session_key, sticker.name)
