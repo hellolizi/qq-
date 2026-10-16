@@ -388,12 +388,19 @@ BROWSER_UA = (
 DATA_FILE = BASE_DIR / "data.json"  # 积分 / 签到 / 提醒的小存档
 MEMORY_FILE = BASE_DIR / "memory.json"  # 长期记忆:聊天存档
 
-# 偷表情包:让识图模型判断这张图是不是表情包
+# 偷表情包:让识图模型仔细判断这张图是不是「聊天用的表情包」,并说清什么时候用。
+# 判断标准写细一点:宁可漏收,也别把照片/截图/商品图收进库里。
 STEAL_PROMPT = (
-    "看这张图,判断它是不是聊天用的表情包(而不是照片、截图、商品图、科普图、聊天记录)。\n"
-    "只回一行 JSON,不要解释:\n"
-    '{"meme":true,"emotion":"核心情绪,4字内","scene":"什么场合会发它,20字内"} '
-    '或 {"meme":false}'
+    "仔细看这张图,判断它是不是聊天里拿来发的那种「表情包 / 梗图」。\n"
+    "算:卡通形象、夸张表情、配文字的搞笑图,用来表达情绪、玩梗、怼人的。\n"
+    "不算:真人照片、风景、纯截图(聊天记录、网页、APP 界面、带聊天气泡或相框的)、"
+    "商品图、科普图、二维码、logo。\n"
+    "拿不准就当不是,别硬认。\n"
+    "想清楚再回,只回一行 JSON,不要任何解释:\n"
+    '{"meme":true,"confidence":0.0,"emotion":"核心情绪,4字内",'
+    '"scene":"什么情况/什么时候会发它,20字内","tags":["3到5个检索词"]}\n'
+    "确定不是表情包就回:{\"meme\":false}\n"
+    "confidence 是 0.0~1.0,你有多确信它是表情包,不确定就往低了打。"
 )
 IMAGE_EXT = {
     "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png",
@@ -448,7 +455,7 @@ IDIOM_SEED = [
     "日新月异", "后来居上", "画蛇添足", "井底之蛙", "守株待兔",
 ]
 
-VERSION = "2.2.1"  # 发布版本号,改了记得打个 tag(仓库根目录 VERSION 文件也要同步)
+VERSION = "2.3.0"  # 发布版本号,改了记得打个 tag(仓库根目录 VERSION 文件也要同步)
 
 HELP_TEXT = (
     "小鲸鱼会这些:\n"
@@ -516,6 +523,11 @@ def strip_at_head(text: str) -> str:
     """去掉开头连着写的 @某某(有的客户端把 @ 并进文字里),
     这样「@小鲸鱼 /踢 @某人」也能认出那个 /踢。"""
     return re.sub(r"^(?:@\S+\s*|\[CQ:at,[^\]]*\]\s*)+", "", text.strip()).strip()
+
+
+def tag_key(text: str) -> str:
+    """把情绪/标签归一化,好比对两张图是不是「同一种情况」。"""
+    return re.sub(r"[\s,，。.!！?？~、·\-_/\\()（）]+", "", str(text or "")).lower()
 
 
 def natural_command(text: str) -> str:
@@ -1707,8 +1719,8 @@ class Bot:
         log.info("图片搜索「%s」命中 %d 张", query[:30], len(images))
         return images
 
-    async def ask_vision(self, text: str, data_url: str) -> str:
-        """拿一张图问识图模型一句话。"""
+    async def ask_vision(self, text: str, data_url: str, max_tokens: int = 200) -> str:
+        """拿一张图问识图模型一句话。max_tokens 大一点能让它看得更仔细。"""
         c = self.cfg
         resp = await self.http.post(
             c.get("deepseek_base_url", "").rstrip("/") + "/chat/completions",
@@ -1723,7 +1735,7 @@ class Bot:
                         ],
                     }
                 ],
-                "max_tokens": 200,
+                "max_tokens": max_tokens,
                 "enable_thinking": False,
             },
             headers={
@@ -3040,13 +3052,18 @@ class Bot:
     # ---------- 偷表情包 ----------
 
     async def steal_stickers(self, images: list[str], event: dict[str, Any]) -> None:
-        """群里别人发的表情包,顺手收进自己库里。"""
+        """群里别人发的表情包,顺手收进自己库里。
+
+        识图这一步按「准确性优先」:判断标准写严、token 给足,
+        不是表情包一律不收;同一种情况(情绪/场景)的只留一张。
+        """
         if not self.cfg.get("steal_stickers", True):
             return
         today = datetime.now().strftime("%Y-%m-%d")
         if self.steal_count.get("day") != today:
             self.steal_count = {"day": today, "n": 0}
         limit = int(self.cfg.get("steal_max_per_day", 8))
+        min_conf = float(self.cfg.get("steal_min_confidence", 0.6))
         for ref in images[:2]:
             if self.steal_count["n"] >= limit:
                 return
@@ -3068,13 +3085,28 @@ class Bot:
             ).lower()
             ext = IMAGE_EXT.get(kind, ".jpg")
             data_url = f"data:{kind};base64,{base64.b64encode(raw).decode()}"
-            verdict = await self.ask_vision(STEAL_PROMPT, data_url)
+            # token 给足,让它把「是不是表情包、什么时候用」看仔细(准确性优先)
+            verdict = await self.ask_vision(STEAL_PROMPT, data_url, max_tokens=320)
             start, end = verdict.find("{"), verdict.rfind("}")
             try:
                 info = json.loads(verdict[start : end + 1])
             except Exception:  # noqa: BLE001
                 continue
             if not info.get("meme"):
+                continue
+            conf = info.get("confidence", 1.0)
+            try:
+                conf = float(conf)
+            except (TypeError, ValueError):
+                conf = 1.0
+            if conf < min_conf:  # 拿不准的宁可不要,别把非表情包收进来
+                log.info("识图只有 %.2f 确信是表情包,不到 %.2f,不收", conf, min_conf)
+                continue
+            emotion = str(info.get("emotion") or "无语")[:8]
+            scene = str(info.get("scene") or "")[:40]
+            taken = self._scene_taken(emotion, scene)
+            if taken:  # 同一种情况已经有一张了,留旧的就行
+                log.info("「%s」这种表情包库里有了(%s),这张就不留了", emotion, taken)
                 continue
             name = f"偷来的_{digest[:6]}{ext}"
             target = STICKER_DIR / name
@@ -3083,8 +3115,8 @@ class Bot:
                 target.write_bytes(raw)
                 item = {
                     "file": name,
-                    "emotion": str(info.get("emotion") or "无语")[:8],
-                    "scene": str(info.get("scene") or "")[:40],
+                    "emotion": emotion,
+                    "scene": scene,
                     "tags": [str(t)[:8] for t in (info.get("tags") or [])][:5],
                 }
                 self._append_sticker_index(item)
@@ -3094,7 +3126,23 @@ class Bot:
             self.stickers.append(item)
             self.known_hashes.add(digest)
             self.steal_count["n"] += 1
-            log.info("偷到一张表情包:%s(%s)", name, item["emotion"])
+            log.info("偷到一张表情包:%s(%s)", name, emotion)
+
+    def _scene_taken(self, emotion: str, scene: str) -> str:
+        """库里有没有「同一种情况」的表情包了?有就返回那张的文件名,同种情况只留一张。
+
+        以情绪为主线比对(情绪一样,基本就是同一个使用场合),
+        情绪词互相包含也算同一类,比如「得意」和「得意忘形」;场景高度重合也算。
+        """
+        e, s = tag_key(emotion), tag_key(scene)
+        for item in self.stickers:
+            old_e = tag_key(item.get("emotion") or "")
+            old_s = tag_key(item.get("scene") or "")
+            if e and old_e and (e == old_e or e in old_e or old_e in e):
+                return str(item.get("file") or "")
+            if s and old_s and (s == old_s or s in old_s or old_s in s):
+                return str(item.get("file") or "")
+        return ""
 
     def _append_sticker_index(self, item: dict[str, Any]) -> None:
         """把新表情包写进 tags.json(读不出来的话就丢一张,别把库弄坏)。"""

@@ -190,6 +190,7 @@
   "report_time": "23:00",
   "report_min_messages": 30,
   "steal_min_seen": 2,
+  "steal_min_confidence": 0.6,
   "sulk_after": 5,
   "reply_max_chars": 300,
   "empty_at_replies": [

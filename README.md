@@ -1,6 +1,6 @@
 # 小鲸鱼
 
-[![version](https://img.shields.io/badge/version-v2.2.1-blue.svg)](https://github.com/hellolizi/qq-/releases)
+[![version](https://img.shields.io/badge/version-v2.3.0-blue.svg)](https://github.com/hellolizi/qq-/releases)
 [![python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/hellolizi/qq-/pulls)
 [![bug 反馈](https://img.shields.io/badge/bug-反馈给我-red.svg)](https://github.com/hellolizi/qq-/issues)
@@ -12,7 +12,7 @@
 
 - 上手看 **[安装指南 INSTALL.md](INSTALL.md)**，从零到跑起来
 - 遇到 bug 去 **[Issues](https://github.com/hellolizi/qq-/issues)** 提，或者直接在群里 @ 我
-- 当前版本 **v2.2.1**，更新内容见 [更新日志](#更新日志)
+- 当前版本 **v2.3.0**，更新内容见 [更新日志](#更新日志)
 
 ## 她都会啥
 
@@ -93,9 +93,12 @@
   `quiet_hours` 是免打扰时段，默认 23:00~08:00 不出声。
 - **群聊日报** —— 每天 23:00 自动发一份：今天聊了啥、名场面、谁最活跃。
   想关就把 `daily_report` 设成 false。
-- **偷表情包** —— 群里别人发的表情包，她会让识图模型看一眼，是表情包就收进自己库里、
-  顺手打好情绪和使用场景的标签，下次聊天就能用上。同一张要**被发到两次以上**才收
-  （`steal_min_seen`），这样截图、照片、商品图基本进不来。每天最多偷 8 张（`steal_max_per_day`）。
+- **偷表情包** —— 群里别人发的图，她会让识图模型**仔细看一眼**：得是聊天表情包 / 梗图才收，
+  真人照片、风景、截图（聊天记录/网页/APP 界面）、商品图、二维码这类一律不收；
+  拿不准就当不是（置信度不到 `steal_min_confidence`，默认 0.6，就不收），宁可漏也别收错。
+  收了会顺手打好「什么情绪、什么情况用」的标签，下次聊天就能用上。
+  同一张要**被发到两次以上**才收（`steal_min_seen`），每天最多偷 8 张（`steal_max_per_day`）。
+  **同一种情况的表情包只留一张**——「被冤枉」已经有图了，再来一张「委屈」的就不留了，省得库里全是同款。
 - **出门前洗一遍** —— 模型爱吐 markdown、bullet、「好的，我帮你看看」这种客服腔，
   还有「（挠头）」这种动作描写。QQ 里 markdown 根本不渲染，所以发出去之前代码会洗一道：
   拆标记、砍客服腔、删动作描写、超长截断（`reply_max_chars`，默认 300 字）。
@@ -212,7 +215,8 @@ copy config.example.json config.json   # 然后把 Key 填进去
 - `split_reply` / `quote_reply` —— 长回复分段发、回复时引用原消息
 - `memory_days` / `memory_recall` —— 长期记忆存多少天、每次捞几条
 - `proactive` / `proactive_idle_minutes` / `quiet_hours` —— 主动冒泡的开关、冷场多久才说话、免打扰时段
-- `steal_stickers` / `steal_max_per_day` —— 偷表情包的开关和每天上限
+- `steal_stickers` / `steal_max_per_day` / `steal_min_confidence` —— 偷表情包的开关、
+  每天上限、识图置信度门槛（低于它就不收，怕收错）
 - `daily_report` / `report_time` —— 群聊日报的开关和发送时间
 - `system_prompt` —— 人设。**写法有讲究，见下面「人设怎么写才像真人」**
 - `temperature` —— 0.75 左右。调高会更跳、更容易说岔；调低会变呆、开始车轱辘话
@@ -296,6 +300,14 @@ NapCat 不回 pong，库就把好端端的连接掐了。现在关掉了客户�
 不想用 GitHub 也行 —— 直接在群里 @ 我，或者把日志贴给我。
 
 ## 更新日志
+
+### v2.3.0
+
+- **偷表情包更挑了**：识图模型会把图看仔细——是聊天表情包 / 梗图才收，
+  照片、截图、商品图、二维码一律不收；拿不准（置信度低于 `steal_min_confidence`，默认 0.6）也不收，宁可漏别收错
+- **同一种情况只留一张**：收了会打「什么情绪、什么情况用」的标签；「被冤枉」已经有图了，
+  再来一张「委屈」的就不留了，省得库里全是同款
+- 识图这一步 token 给足（准确性优先，其次才是省）
 
 ### v2.2.1
 
