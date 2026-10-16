@@ -43,6 +43,11 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%H:%M:%S",
+    handlers=[
+        logging.StreamHandler(),
+        # 顺便写一份到文件,断线这类事过去就刷没了,不好查
+        logging.FileHandler(BASE_DIR / "bot.log", encoding="utf-8"),
+    ],
 )
 log = logging.getLogger("qq-ds")
 
@@ -234,6 +239,8 @@ class Bot:
         self.recent_stickers: dict[str, list[str]] = defaultdict(list)
         # 本地表情包库(读不到就是空的,功能自动隐身)
         self.stickers, self.sticker_tags = self._load_stickers()
+        # 最近一次收到任何消息的时间,NapCat 每 30 秒会推心跳,拿它判断连接死没死
+        self.last_msg_at = time.time()
 
     # ---------- 表情包 ----------
 
@@ -988,6 +995,18 @@ class Bot:
 
     # ---------- 主循环 ----------
 
+    async def watch_stale(self) -> None:
+        """盯着心跳。NapCat 每 30 秒推一次,90 秒一点动静都没有就当中断了。"""
+        while True:
+            await asyncio.sleep(15)
+            if self.ws is not None and time.time() - self.last_msg_at > 90:
+                log.warning("90 秒没收到任何心跳,连接像死了,主动重连")
+                self.last_msg_at = time.time()
+                try:
+                    await self.ws.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
     async def run(self) -> None:
         url = self.cfg["onebot_ws_url"]
         headers = {}
@@ -996,14 +1015,26 @@ class Bot:
             headers["Authorization"] = f"Bearer {token}"
         headers["User-Agent"] = "qq-deepseek-bot/1.0"
 
+        asyncio.create_task(self.watch_stale())
+        tries = 0
         while True:
             try:
                 async with websockets.connect(
-                    url, additional_headers=headers, max_size=None
+                    url,
+                    additional_headers=headers,
+                    max_size=None,
+                    # 关键:NapCat 不回 pong,库自带的心跳会把好端端的连接掐掉,
+                    # 表现就是每 40 秒断一次。关掉它,改用上面的 watch_stale
+                    ping_interval=None,
+                    ping_timeout=None,
+                    close_timeout=5,
                 ) as ws:
                     self.ws = ws
+                    self.last_msg_at = time.time()
+                    tries = 0
                     log.info("已连接 OneBot:%s", url)
                     async for raw in ws:
+                        self.last_msg_at = time.time()
                         try:
                             data = json.loads(raw)
                         except json.JSONDecodeError:
@@ -1012,7 +1043,9 @@ class Bot:
                             asyncio.create_task(self.on_event(data))
             except Exception as exc:  # noqa: BLE001
                 self.ws = None
-                log.warning("与 OneBot 的连接断开(%s),5 秒后重连……", exc)
+                self.last_msg_at = time.time()
+                tries += 1
+                log.warning("与 OneBot 的连接断开(%s),5 秒后重连(第 %d 次)", exc, tries)
                 await asyncio.sleep(5)
 
 
