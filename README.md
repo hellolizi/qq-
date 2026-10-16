@@ -1,10 +1,23 @@
 # 小鲸鱼
 
+[![version](https://img.shields.io/badge/version-v2.2.0-blue.svg)](https://github.com/hellolizi/qq-/releases)
+[![python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
+[![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/hellolizi/qq-/pulls)
+[![bug 反馈](https://img.shields.io/badge/bug-反馈给我-red.svg)](https://github.com/hellolizi/qq-/issues)
+
 给自己群写的 QQ 机器人，一只住在群里的蓝色小鲸鱼。
 
 平时在群里瞎聊、玩梗、偶尔损人一句；真问正经问题的时候又挺靠谱。
+**不打命令，说人话它也听得懂** —— 想查余额、看天气、搜东西、画张图，直接开口就行。
+
+- 上手看 **[安装指南 INSTALL.md](INSTALL.md)**，从零到跑起来
+- 遇到 bug 去 **[Issues](https://github.com/hellolizi/qq-/issues)** 提，或者直接在群里 @ 我
+- 当前版本 **v2.2.0**，更新内容见 [更新日志](#更新日志)
 
 ## 她都会啥
+
+- **说人话就能使唤（不用打命令）** —— 「帮我看下还剩多少钱」「杭州今天天气咋样」「这啥意思帮我搜搜」
+  「给我画张奶龙的图」，它自己判断要不要动手、动哪个，然后把结果用大白话回你。
 
 - **聊天** —— 群里 @ 她，或者私聊。说话短，尽量不像机器人。
 - **看图片** —— 先发图，再 @ 她问。图发完 3 分钟内 @ 就行，不用和 @ 挤在一条消息里。
@@ -145,6 +158,7 @@ QQ
 
 - `bot.py` —— 全部逻辑，就这一个文件
 - `config.example.json` —— 配置模板，复制一份改名叫 `config.json` 再填
+- `INSTALL.md` —— 安装指南，从零到跑起来
 - `requirements.txt` —— 依赖（websockets / httpx / Pillow）
 - `启动.bat` —— 一键拉起 NapCat + 在窗口里画二维码 + 机器人
 - `二维码.py` —— 把 NapCat 的登录码画在终端里，手机对着屏幕扫；`二维码.bat` 是它的外壳
@@ -154,17 +168,18 @@ QQ
 - `memory.json` —— 长期记忆的聊天存档，也自己生成（已 gitignore）
 - `NapCat/` —— 别人写的程序，得自己去下，没放进仓库
 
-## 怎么用起来
+## 怎么跑起来
 
-1. 装依赖：`pip install -r requirements.txt`
-2. 下 NapCatQQ 解压到 `NapCat/`，第一次要用管理员权限跑一遍，然后扫码登录 QQ
-3. 在 NapCat 的 WebUI 里开一个正向 WebSocket，端口跟 `onebot_ws_url` 对上
-4. `copy config.example.json config.json`，把 Key 填上
-5. 双击 `启动.bat`
-6. （可选）阿里云账户那段要能查，得在 `aliyun_access_key_id` / `aliyun_access_key_secret` 里填一组有
-   `QueryAccountBalance` + `DescribeCoupons` 权限的 RAM 密钥。不填就只报官网余额，不报错。
+三步：**装依赖 → 配 `config.json` → 双击 `启动.bat`**。
 
-   以前 `/余额` 还要装阿里云百炼的命令行（`bl`）来查模型免费额度，现在这块不报了，不用装了。
+详细的（含 NapCat 登录、扫码、可选阿里云密钥、常见问题）都在 **[安装指南 INSTALL.md](INSTALL.md)**，照着做就行。
+
+一句话版本：
+
+```powershell
+pip install -r requirements.txt
+copy config.example.json config.json   # 然后把 Key 填进去
+```
 
 `config.json` 里有 Key，所以我把它写进 `.gitignore` 了，别手滑传上去。
 
@@ -264,3 +279,33 @@ QQ
 **一直断线，几十秒断一次。** `websockets` 客户端默认每 20 秒 ping 一次，
 NapCat 不回 pong，库就把好端端的连接掐了。现在关掉了客户端心跳，
 改看 NapCat 自己的心跳（90 秒没动静才重连）。日志会写 `bot.log`，出问题先看它。
+
+## 反馈 / 报 bug
+
+**GitHub 上可以评论吗？可以。** 这个仓库开了 [Issues](https://github.com/hellolizi/qq-/issues)，
+任何有 GitHub 账号的人都能来提、来评论；[PR](https://github.com/hellolizi/qq-/pulls) 也能评论和审查。
+想在仓库里开个随便聊的讨论区，把 **Discussions** 打开就行。
+
+报 bug 时，**尽量带上这几样**，我好复现：
+
+- 你**说了什么**、它**回了什么**（截图或原文都行）
+- 命令行窗口里有没有红色报错，或 `bot.log` 里对应时间的那几行
+- 你的 `config.json` 只贴**去掉 Key 的**那部分（Key 千万别贴出来）
+
+不想用 GitHub 也行 —— 直接在群里 @ 我，或者把日志贴给我。
+
+## 更新日志
+
+### v2.2.0
+
+- **说人话就能使唤**：不用打命令，「帮我看下还剩多少钱」「杭州今天天气咋样」这类，它自己判断要不要动手
+- **接话窗**：它说完话后一小会儿（`followup_seconds`，默认 60 秒），别人接着说的短句、疑问句，没 @ 也理，像在跟你聊天
+- **把 @ 打成文字也认**：「@小鲸鱼 /踢 @某人」这种写法现在也当命令处理
+- **修了个踢人误判**：之前「你不用 at 了？」里的 `t` 被当成「踢」，会被拐进踢人流程，已修
+- **余额更精简**：只报官网余额 + 阿里云账户（现金/券），不再刷模型免费额度
+- **日报时间** 21:00 → 23:00
+
+## 许可
+
+暂时没指定 License。如果你想开源给别人随便用，建议加个 **MIT**，
+说一声我就把 `LICENSE` 文件补上。
