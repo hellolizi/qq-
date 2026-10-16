@@ -210,13 +210,21 @@ def split_sticker_marker(text: str) -> tuple[str, str]:
 
 
 # 上下文里别人说话都是「昵称: 内容」,模型有时会照抄这个格式,
-# 在自己回复前面也顶一个「小鲸鱼:」——那是它自己的名字,不该出现在话里。
+# 在自己回复前面顶一个「小鲸鱼:」,或者干脆顶着当前说话人的名字——都要去掉。
 SELF_PREFIX_RE = re.compile(r"^\s*(?:小鲸鱼|鲸鲸|鲸鱼娘)\s*[:：]\s*")
 
 
-def strip_self_prefix(text: str) -> str:
-    """去掉模型自己加在句首的「小鲸鱼:」。"""
-    return SELF_PREFIX_RE.sub("", text, count=1).strip()
+def strip_self_prefix(text: str, names: tuple[str, ...] | list[str] = ()) -> str:
+    """去掉模型抄格式加在句首的「某某:」:它自己的名字,或者当前说话人的昵称。"""
+    out = SELF_PREFIX_RE.sub("", text, count=1).strip()
+    for name in names:
+        name = (name or "").strip()
+        if not name or len(name) > 12:
+            continue
+        pattern = rf"^{re.escape(name)}\s*[:：]\s*"
+        if re.match(pattern, out):
+            return re.sub(pattern, "", out, count=1).strip()
+    return out
 
 
 def split_draw_marker(text: str) -> tuple[str, bool]:
@@ -939,7 +947,7 @@ class Bot:
             raise RuntimeError(f"模型接口错误 {resp.status_code}")
 
         content = strip_self_prefix(
-            (resp.json()["choices"][0]["message"].get("content") or "").strip()
+            (resp.json()["choices"][0]["message"].get("content") or "").strip(), (speaker,)
         )
 
         # 上下文里只留纯文字,避免每轮重传整张图
