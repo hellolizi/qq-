@@ -41,10 +41,10 @@
     "小鲸",
     "鲸鲸"
   ],
-  "chime_chance": 0.08,
-  "chime_cooldown": 90,
+  "chime_chance": 0.03,
+  "chime_cooldown": 300,
   "followup_seconds": 60,
-  "followup_max_chars": 12,
+  "followup_max_chars": 8,
   "reply_timeout": 60,
   "safe_domains": [
     "qq.com",

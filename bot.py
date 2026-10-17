@@ -185,7 +185,8 @@ NATURAL_HINT = (
     "你的知识有截止时间,凡是带「现在 / 最新 / 最近 / 出了没 / 什么时候出 / 什么版本」的事实问题,"
     "一律先 web_search 再开口,比如:\n"
     "游戏 / 动漫 / 影视 / 软件 / 模型 出没出、什么版本、最新改动、角色强度;"
-    "比赛结果、谁夺冠、谁转会、股价、票价;新品发布、政策、价格变动这类新闻。\n"
+    "比赛结果(谁赢、谁能赢、谁夺冠、比分、几比几、今天打没打、几点开打)、谁转会、股价、票价;"
+    "新品发布、政策、价格变动这类新闻。\n"
     "拿不准就去搜;搜不到就说「我搜了下没找到准的」或者「这我不确定」,"
     "**绝对不许凭记忆断言「还没出」「不存在」「没这回事」**——"
     "你不知道的东西,很可能是你训练数据之后才出的。\n"
@@ -869,6 +870,8 @@ class Bot:
         self.last_active: dict[str, float] = {}
         # 冷场主动冒泡的退避倍数:一直没人说话就 1→2→4…(proactive_backoff_max 封顶),有人说话归 1
         self.proactive_backoff: dict[str, int] = {}
+        # 接话窗里只认「刚才跟她对话的那个人」:别人插话不算冲她说的
+        self.followup_partner: dict[str, str] = {}
         # 没人叫它、它自己插话的时间点,免得连着搭话刷屏
         self.last_chime: dict[str, float] = {}
         # 她最近一次在群里说话的时刻,用来开「接话窗」:刚聊完那一小会儿,别人接着说的短句也理
@@ -1063,6 +1066,8 @@ class Bot:
         只有主聊天/应答才开;日报、主动冒泡、偷表情包这种自己冒出来的不算。"""
         if event.get("message_type") == "group":
             self.last_bot_speak[session_key] = time.time()
+            # 记下刚才是跟谁在聊:接话窗只接这个人的下文
+            self.followup_partner[session_key] = str(event.get("user_id") or "")
 
     async def send_sticker(self, event: dict[str, Any], path: Path) -> None:
         """把本地表情包当图片发出去。"""
@@ -1144,23 +1149,28 @@ class Bot:
             return stripped if (stripped or has_images) else None
         if mode == "at":
             return None
-        # smart:没人叫它也能搭一句,但按概率来,还有冷却和免打扰,免得每条都插嘴
+        # smart:没人叫它也能搭一句,但先得弄清楚「这句是不是冲它说的」
         if not has_content:
             return None
         key = f"group_{event.get('group_id')}"
         now = time.time()
-        # 她刚说完话的一小会儿:别人接着说的短句、疑问句,就算没 @ 也理,像在接着聊
+        # 这句 @ 了别人(又不是在叫它)——那是在跟别人说话,一句都别插
+        if self.parse_at_targets(event):
+            return None
+        # 她刚跟某人说完话的一小会儿:那个人自己接着说的短句或追问,才算还在跟它聊;
+        # 别人插进来的话不算。而且这里不续期,免得一路接下去变成「群里每一条都回」
         follow = float(self.cfg.get("followup_seconds", 60))
         if follow > 0 and now - self.last_bot_speak.get(key, 0) <= follow:
-            tail = self._strip_call(text)
-            if (
-                not tail
-                or tail.endswith(("?", "？"))
-                or len(tail) <= int(self.cfg.get("followup_max_chars", 12))
-            ) and not self.in_quiet_hours():
-                self.last_bot_speak[key] = now
-                return text
-        if now - self.last_chime.get(key, 0) < float(self.cfg.get("chime_cooldown", 90)):
+            talking_to = self.followup_partner.get(key, "")
+            if talking_to and str(event.get("user_id") or "") == talking_to:
+                tail = self._strip_call(text)
+                if (
+                    not tail
+                    or tail.endswith(("?", "？"))
+                    or len(tail) <= int(self.cfg.get("followup_max_chars", 8))
+                ) and not self.in_quiet_hours():
+                    return text
+        if now - self.last_chime.get(key, 0) < float(self.cfg.get("chime_cooldown", 300)):
             return None
         # 上次说完话一直没人接,就别再往上凑了
         sulk = int(self.cfg.get("sulk_after", 5))
@@ -1168,7 +1178,7 @@ class Bot:
             return None
         if self.in_quiet_hours():
             return None
-        if random.random() < float(self.cfg.get("chime_chance", 0.08)):
+        if random.random() < float(self.cfg.get("chime_chance", 0.03)):
             self.last_chime[key] = now
             return text
         return None
