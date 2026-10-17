@@ -180,6 +180,7 @@
   "proactive_idle_minutes": 45,
   "proactive_chance": 0.35,
   "proactive_min_messages": 6,
+  "proactive_backoff_max": 6,
   "quiet_hours": [
     23,
     10

@@ -852,6 +852,8 @@ class Bot:
         self.stats: dict[str, dict[str, Any]] = {}
         self.day_log: dict[str, list[str]] = defaultdict(list)
         self.last_active: dict[str, float] = {}
+        # 冷场主动冒泡的退避倍数:一直没人说话就 1→2→4…(proactive_backoff_max 封顶),有人说话归 1
+        self.proactive_backoff: dict[str, int] = {}
         # 没人叫它、它自己插话的时间点,免得连着搭话刷屏
         self.last_chime: dict[str, float] = {}
         # 她最近一次在群里说话的时刻,用来开「接话窗」:刚聊完那一小会儿,别人接着说的短句也理
@@ -2941,6 +2943,7 @@ class Bot:
         if text and len(self.day_log[session_key]) < 400:
             self.day_log[session_key].append(f"{who}: {text[:80]}")
         self.last_active[session_key] = time.time()
+        self.proactive_backoff[session_key] = 1  # 有人说话了,冷场冒泡的退避重置
         self.memory.add(session_key, who, text)
 
     def stats_text(self, session_key: str) -> str:
@@ -3008,7 +3011,11 @@ class Bot:
         return (await self.ask_plain(prompt, max_tokens=60)).strip()
 
     async def maybe_speak(self) -> None:
-        """冷场时主动说一句。"""
+        """冷场时主动说一句。
+
+        一直没人说话就一次比一次晚:每冒完一次泡还是没人接,下次的等待时间翻倍
+        (45→90→180 分钟…,到 `proactive_backoff_max` 倍封顶);群里一有人说话就归位。
+        """
         if not self.cfg.get("proactive", True):
             return
         if self.in_quiet_hours():
@@ -3016,9 +3023,14 @@ class Bot:
         idle = float(self.cfg.get("proactive_idle_minutes", 45)) * 60
         need = int(self.cfg.get("proactive_min_messages", 6))
         sulk = int(self.cfg.get("sulk_after", 5))
+        cap = max(1, int(self.cfg.get("proactive_backoff_max", 6)))
         now = time.time()
         for key, last in list(self.last_active.items()):
-            if not key.startswith("group_") or now - last < idle:
+            if not key.startswith("group_"):
+                continue
+            # 退避倍数越大,越要等更久才冒泡
+            backoff = max(1, int(self.proactive_backoff.get(key, 1)))
+            if now - last < idle * backoff:
                 continue
             if (self.stats.get(key) or {}).get("count", 0) < need:
                 continue
@@ -3028,11 +3040,17 @@ class Bot:
                 continue
             if random.random() > float(self.cfg.get("proactive_chance", 0.35)):
                 continue
+            # 到这一步说明又是靠冷场触发的,多半还是没人理:下次隔更久(翻倍,封顶)
+            self.proactive_backoff[key] = min(backoff * 2, cap)
             self.last_active[key] = now  # 冒过泡就重新计时,别连着蹦出来
             line = await self.proactive_line(key)
             if not line:
                 continue
-            log.info("主动冒个泡:%s", line)
+            log.info(
+                "主动冒个泡:%s(下次至少隔 %d 分钟)",
+                line,
+                int(idle * self.proactive_backoff[key] // 60),
+            )
             await self.send(
                 {"message_type": "group", "group_id": key.split("_", 1)[1]}, line
             )
