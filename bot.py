@@ -1096,9 +1096,9 @@ class Bot:
         return re.sub(r"[\s,，。!！?？~、]+", "", t)
 
     def in_quiet_hours(self) -> bool:
-        """现在是不是免打扰时段(夜里的 23:00~08:00)。"""
+        """现在是不是免打扰时段(默认 23:00~10:00)。只挡主动说话,被 @ / 点名 / 私聊照样回。"""
         hour = datetime.now().hour
-        quiet = self.cfg.get("quiet_hours") or [23, 8]
+        quiet = self.cfg.get("quiet_hours") or [23, 10]
         start, end = int(quiet[0]), int(quiet[1])
         if start > end:
             return hour >= start or hour < end

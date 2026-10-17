@@ -182,7 +182,7 @@
   "proactive_min_messages": 6,
   "quiet_hours": [
     23,
-    8
+    10
   ],
   "steal_stickers": true,
   "steal_max_per_day": 8,
