@@ -18,16 +18,17 @@ import hmac
 import html
 import json
 import logging
+import math
 import mimetypes
 import os
 import random
 import re
-import shutil
 import sys
 import time
 import uuid
 from collections import defaultdict, deque
 from datetime import datetime, timedelta
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit, urlunsplit
@@ -58,9 +59,6 @@ log = logging.getLogger("qq-ds")
 
 RESET_WORDS = {"重置", "清空", "忘记", "/reset", "重置对话"}
 
-# 聊天模型用它来表示"这句是在要图,该去生图",而不是普通回复
-DRAW_MARK = "[DRAW]"
-
 # 生图前先用联网模型把画面描述查准,免得画错角色(比如"奶龙"其实是黄色幼龙)
 DRAW_PROMPT_TPL = (
     "你是绘图提示词专家。用户想生成一张图。\n"
@@ -85,7 +83,13 @@ REF_GUIDE_TPL = (
 SEARCH_HINT = (
     "\n这次你联网查过资料了。回答的最后请另起一行给出配图指令:\n"
     "适合配图 → `[IMG] 名词性搜索词`(例如「大熊猫」,不要用「大熊猫长什么样」这种问句);\n"
-    "不适合配图(观点、是非、计算类问题)→ `[IMG] 无`。"
+    "不适合配图(观点、是非、计算类问题)→ `[IMG] 无`。\n"
+    "【答案要拿搜到的东西核对过再说】只讲搜到的内容,别拿记忆里的旧信息补;"
+    "搜到的东西互相打架、或者只搜到旧消息,就如实说一声(「网上说法不一致」"
+    "「只搜到旧的」),别硬凑一个结论;真没搜到就直说没查到。"
+    "【先看发布时间,只拿最新的说事】资料里带日期的挑最近那条当现状,"
+    "明显的旧日期(去年、上个月、往届赛事)别当现在讲——那件事可能早结束了"
+    "(世界杯早落幕了就别还讲谁踢谁);只有旧消息就说「搜到的都是旧消息,可能过时了」。"
 )
 
 # 这些是给程序看的约定,由代码追加到 system_prompt 后面。
@@ -107,7 +111,9 @@ ROUTING_HINT = (
     "展开也只讲结论和要点,不要铺垫,不要总结收尾。\n"
     "8. 别露出 AI 味:不要说「作为AI」「请问有什么可以帮您」「希望以上内容对您有帮助」"
     "这类客服话术;不要解释自己在干什么,不要升华总结,不要每次都热情收尾。\n"
-    "9. emoji 和颜文字最多一个,大多数时候一个都别用。\n"
+    "9. 说话必须带口癖:每句话句尾都挂一个「喵」,每个断句后面再挂一个颜文字"
+    "(像 (≧▽≦) (´・ω・`) 这种)。闲聊、正经回答、报错、日报一律照挂,不用省;"
+    "emoji 反而要克制。\n"
     "10. 群聊里别人说的话前面带发言人昵称(格式「昵称: 内容」),"
     "你自己叫「小鲸鱼」,但你回话的时候不要在自己前面加「小鲸鱼:」,直接说内容就行。"
     "要分清谁是谁,别把张三说的话记到李四头上;"
@@ -116,7 +122,28 @@ ROUTING_HINT = (
     "要回到上文里找指代对象,不要每次都当成全新话题。\n"
     "12. 群里之前聊的只是背景。别人现在问什么就答什么,"
     "别把上一轮的旧话题(比如刚聊过的踢人/管理员)硬接过来;"
-    "别人只是叫你一声、没说别的事,就简单应一句,别自己扯开。"
+    "别人只是叫你一声、没说别的事,就简单应一句,别自己扯开。\n"
+    "13. 认账。别人说「你刚才不是说……吗」「你自己说的」时,先看两条:"
+    "上下文里你自己的发言,以及【你自己最近说过的话】那一块(那都是你说出口的);"
+    "有就承认(「欸对 我说过」「是我说的」),不许反过来说「我没说过」;"
+    "都没有、你也确实想不起来,就含糊点(「我记不太清了」),别一口咬定自己没说过。\n"
+    "14. 别人消息里带「(引用 某某: …)」的,那是他引用的旧消息,"
+    "不是他现在说的话;他现在想说的只是引用后面的那几句。\n"
+    "15. 同一个人的游戏 ID、真名、昵称、外号都很常见,别因为叫法不一样就说"
+    "「这是两个人」(比如 ZMJJKK 和康康就是同一个人)。拿不准谁是谁、或者"
+    "谁跟谁是不是一个人,先联网查一句再答,别硬猜;查不到就老实说不知道。\n"
+    "16. 别人问「他现在还……吗」「他今年多大了」这类**关于某个人近况**的问题时,"
+    "别拿脑子里的旧印象答 —— 那几个数字(年龄、成绩、还在不在队里)每年都在变。"
+    "拿不准就先搜,搜不到就说「我不确定啊,得查一下」。\n"
+    "17. 别老拿「？」「怎么了？」「嗯？」这种没内容的话糊弄人:对方重复发同一件事、"
+    "又把同一句/同一张图发一遍、或者又戳你一下,意思多半跟刚才一样 —— 就按同一件事回,"
+    "或者干脆不吭声,别一遍遍反问。只有他发的东西你是真看不懂(一串标点、一串乱码、"
+    "没头没尾半句话),才回一句「？」或者「怎么了」。\n"
+    "18. 用户要「表情包」「表情」「梗图」(例如「发张表情包」「来张委屈的表情包」)时,"
+    "是让你**从【能发的表情包】清单里挑一张现成的发**,不是让你画一张:"
+    "照清单的规矩在回复最后另起一行写 `[STICKER] 文件名`,不要在正文里输出 `[DRAW]` "
+    "或 `[FIND]`,也别上网找、更别生图。他点名要哪个角色/哪种情绪的表情包,"
+    "先在清单里找对得上;清单里实在没有那样儿的,才如实说库里没有这种。"
 )
 
 
@@ -150,7 +177,16 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "get_hot",
-            "description": "看百度实时热搜榜",
+            "description": "看百度实时热搜榜(全网热点,不是本群在聊的东西)",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "group_topic",
+            "description": "看本群最近反复在聊什么话题(群里自己的常聊话题)。"
+            "问「群里有什么热点话题 / 最近在聊啥」就用这个,不是百度全网热搜",
             "parameters": {"type": "object", "properties": {}, "required": []},
         },
     },
@@ -176,11 +212,16 @@ TOOLS = [
     },
 ]
 
+# 代码替她先搜过的那些,就别再挂 web_search 工具了:
+# 快模型不一定理「别再搜一遍」那句提示,自己又搜一次就是白等十几秒。
+TOOLS_NO_SEARCH = [t for t in TOOLS if t["function"]["name"] != "web_search"]
+
 # 挂了工具时补一句,让她知道这些能自己办,别嘴上说「我查不了」
 NATURAL_HINT = (
     "\n\n【你自己的本事(需要时直接调工具拿结果,别嘴上说「我查不了」)】\n"
-    "查钱/还剩多少→check_balance;查天气→get_weather;看热搜→get_hot;"
-    "看本群今天活跃度→group_stats;要最新或你自己拿不准的事→web_search。\n"
+    "查钱/还剩多少→check_balance;查天气→get_weather;看百度全网热搜→get_hot;"
+    "看本群今天活跃度→group_stats;看本群最近爱聊什么话题→group_topic(群里的热点,不是全网);"
+    "要最新或你自己拿不准的事→web_search。\n"
     "【哪些事必须联网查,不许凭记忆答】\n"
     "你的知识有截止时间,凡是带「现在 / 最新 / 最近 / 出了没 / 什么时候出 / 什么版本」的事实问题,"
     "一律先 web_search 再开口,比如:\n"
@@ -198,6 +239,165 @@ NATURAL_HINT = (
 TODAY_TPL = (
     "\n\n【今天是 {date}】你的训练数据比这天早,"
     "所以「最近 / 最新 / 出了没」这类问题,先搜再答,别拿记忆当事实。\n"
+)
+
+# 光靠模型自己想起来「该联网」不保险(快模型经常不开工具就凭记忆答),
+# 所以代码替它认一遍:这句是不是时效性问题。认出来就先搜,把资料塞进上下文。
+# 赛事名要单独列:「世界杯」三个字里没有「比赛 / 谁赢」这些词,以前压根不认,
+# 结果有人问世界杯它就拿旧闻答,赛事早就结束了还在讲。
+FRESH_RE = re.compile(
+    r"(比赛|赛事|比分|几比几|谁赢|谁能赢|谁夺冠|夺冠|半决赛|决赛|"
+    r"最新|出了没|出没出|还没出|发售|上映|转会|股价|票价|"
+    r"几点开|几点开始|什么时候出|什么时候开|版本更新|"
+    r"世界杯|欧洲杯|亚洲杯|美洲杯|奥运会|奥运|冬奥|亚运会|世预赛|"
+    r"NBA|欧冠|欧联|中超|亚冠|英超|西甲|德甲|意甲|法甲|季后赛|总决赛|常规赛|"
+    r"大选|选举|公投|"
+    # 「谁强 / 谁厉害」这种比高下的问题,答案每年都变,别凭印象答
+    # (踩过:有人问「zmjjkk 和 kangkang 谁强」,她拿旧印象当成两个人分别点评)
+    r"谁强|谁更强|谁厉害|谁更厉害|谁牛|谁更牛|"
+    # 「现在…厉害吗 / 今年多大」这类问某个人近况的,年龄和状态一直在变
+    # (踩过:老詹都 40 了,她还说 39)
+    r"退役|复出|转会|"
+    r"现在.{0,8}(厉害|强不强|怎么样|咋样|怎样|状态|退役|复出|多大|几岁|还在|在不在)|"
+    r"今年.{0,8}(多大|几岁|退役|复出|还在|怎么样|咋样|厉害))"
+)
+
+# 时效问题还得是「在问事」的,才算数。上面那一堆词只是「可能跟时间有关」,
+# 光命中就把整句话搜一遍的话,群里随口一句「我进决赛了」「票价好贵」也会被搜,
+# 又慢又费钱。这里再认一遍:带问号,或者带「谁/哪/几/多少/什么时候/吗/呢」这种问句腔。
+ASK_RE = re.compile(
+    r"[?？]|谁|哪|几|多少|多大|几岁|什么时候|几点|是不是|有没有|咋|怎么|为什么|为啥|"
+    r"吗|呢|最新|出了没|出没出|还没出"
+)
+
+# 发给搜索模型的要求。以前只甩一句用户原话,搜索模型不知道「现在」是几号,
+# 逮着几年前那届世界杯的旧网页就当有效结果返回。
+# 把「今天几号」和「只看最近发布的、过期的排掉」写进 system,让它在服务端就按时间筛。
+SEARCH_ASK_SYS = (
+    "你是一个联网搜索助手,今天是 {date}。\n"
+    "只采用最近发布的内容,优先最新的来源;往年旧闻、已经结束或者停更的事,"
+    "一律当过期信息排掉,别拿它描述现状。\n"
+    "【写短点,别啰嗦】先一句话给结论(60 字以内,能一行说完最好),"
+    "再列 2 条来源,每条都标上发布时间(比如「2026年7月20日」)。\n"
+    "【最后另起一行,只写一个词】\n"
+    "两条来源说法一样 → 写「一致」;\n"
+    "说法不一样 → 写「不一致」,并点一句分歧在哪;\n"
+    "实在只搜到一条来源 → 写「单源」;\n"
+    "搜到的全是旧消息、没有更新的 → 写「只搜到旧消息」。\n"
+    "另外:要是搜索结果本身是个梗 / 流行语(比如群里有人提了你不认识的词,"
+    "一搜发现是个梗),就顺带说一句它出自哪儿、平时怎么用。\n"
+)
+
+# 来源打架时不重问一遍同样的问题,换一批来源找;要求也换成「专门核对分歧」。
+SEARCH_ASK_SYS_B = (
+    "你是一个联网搜索助手,今天是 {date}。\n"
+    "上一个搜索给出的两条来源说法不一致,请换一批来源(换个说法查、找官方或更权威的)"
+    "重新核对,重点把分歧点说清楚。\n"
+    "只采用最近发布的内容;写短点:一句话结论(60 字以内)+ 2 条来源,每条标发布时间。"
+)
+
+# 搜索模型自己标的「不一致 / 单源 / 只搜到旧消息」。命中就说明没搜到能互相印证的结论,
+# 这才值得再补搜一趟 —— 一致的话一次就收工,别白等第二次。
+CONFLICT_RE = re.compile(r"不一致|单源|只搜到旧消息")
+
+# 群里最近在聊什么,拿它给搜索定个语境。没有语境的话,问题里的名字/缩写会被按字面
+# 当成别的领域的人 —— 踩过:群里一直在聊无畏契约,问「ZMJJKK 和 LUKXO 谁厉害」,
+# 搜索模型却匹配到足球、网球运动员头上。这里要求它先按群里的话题去搜,
+# 这条线索搜不到再放宽重搜,但绝不能换成同名的其他人来充数。
+SEARCH_TOPIC_TPL = (
+    "\n【语境】群里最近在聊:{topic}\n"
+    "问题里出现的名字、缩写,很可能就是这段语境下的人或角色,"
+    "请优先按这个话题去搜(比如把话题关键词一起带上),"
+    "不要按字面去匹配同名的运动员、明星等其他领域的人。\n"
+    "先用话题相关的关键词搜;这条线索确实搜不到,再换一个更宽的说法重搜一遍;"
+    "还是搜不到就如实说「没搜到」,不许拿别的领域同名的人顶上。\n"
+)
+
+# ---- 常聊话题预热 ----
+# 群里反复出现的词,就是这个群「爱聊什么」。攒够了就提前替他们搜好存着,
+# 下次聊到这个话题直接拿现成的资料答 —— 不用当场联网干等十几秒(这就是「回答很慢」的根源)。
+TOPIC_CACHE_FILE = BASE_DIR / "topic_cache.json"
+TOPIC_HOT_MIN = 3  # 至少几条消息里都出现,才算常聊话题(免得把随口一句当成话题)
+TOPIC_MAX = 3  # 每个会话最多跟踪几个话题
+# 话题越老搜得越稀的衰减指数:hours = 最新频率 × (活了几天 + 1) ^ 0.43
+# 0.43 是配着来的 —— 刚出来(0 天)正好一天一次,活到 90 天(约三个月)正好顶到一周一次
+TOPIC_AGE_POW = 0.43
+TOPIC_TERM_RE = re.compile(r"[\u4e00-\u9fff]+|[A-Za-z0-9_]{3,}")
+
+# 「群里最近都在聊什么 / 有什么热点话题」这类问题,代码直接拿常聊话题答,
+# 不指望快模型自己想起来调工具(它经常想不起来)。只认明显在问「群里的」话题,
+# 不带「群」的「热点」不算 —— 那是全网热搜,走 get_hot,别混一起。
+TOPIC_Q_RE = re.compile(
+    r"(热点话题|热门话题|话题榜|常聊|群里.*话题|都在聊什么|都在聊啥|聊什么话题|什么话题)"
+)
+# 这些词天天见、遍地都是,不算话题,免得拿去搜白花钱
+TOPIC_STOPWORDS = {
+    "你们", "我们", "他们", "什么", "这个", "那个", "就是", "可以", "不是", "没有",
+    "这么", "那么", "怎么", "因为", "所以", "现在", "已经", "一个", "一下", "真的",
+    "哈哈", "笑死", "自己", "知道", "觉得", "应该", "还是", "只是", "但是", "而且",
+    "时候", "东西", "事情", "问题", "为啥", "为什么", "有没有", "怎么样", "什么样",
+    # 纯口头语 / 时间词:天天出现却不是话题 —— 混进「常聊话题」既难看又白费一次搜索
+    "好的", "嗯嗯", "哦哦", "行吧", "没事", "确实", "有点", "好像", "感觉", "大家",
+    "今天", "明天", "昨天", "早上", "晚上",
+}
+# 提前搜好的话题资料,当作背景摆给她 —— 让她知道群里在聊什么,聊到时不必再搜
+TOPIC_BRIEF_TPL = (
+    "\n【你之前替群里查过的资料】群里最近常聊这些话题,你已经提前搜过、资料在这儿:\n"
+    "{items}\n"
+    "(聊到这些话题就直接用上面的,别再说「我去搜一下」;上面没有的就直说没查到,别硬编。)\n"
+)
+
+# ---- 网上的梗 ----
+# 群里说什么梗、网上最近流行什么,她未必认识。这里每天上网扒一批最近流行的梗存着,
+# 说话时她自己判断能不能自然用上 —— 能就顺口来一句,对不上就绝不硬塞。
+# 梗只从网上来,不从群聊里抠(群聊里抠出来的多是错的、或者过两天就没人懂了)。
+MEME_CACHE_FILE = BASE_DIR / "meme_cache.json"
+MEME_MAX = 8  # 每次注入几条给聊天模型
+MEME_FORGET_DAYS = 30  # 梗也有保质期:没人提超过这么多天就删
+MEME_FEEDBACK_MSGS = 3  # 她用了梗之后,收到几条群消息就分析一下大家感不感冒
+
+# 让它上网查梗时用的要求:只回 JSON 数组,好解析;只要短句,别要长篇段子。
+MEME_ASK_SYS = (
+    "你是一个网络流行语助手,今天是 {date}。\n"
+    "请联网查一下最近(近一两个月)网上流行的梗、热梗、流行语,"
+    "以及常见的「评论区句式」(别人爱在评论里跟着刷的那种短句)。\n"
+    "只挑日常聊天里真能拿来用的短句,一句话那种;"
+    "长篇段子、过时好几年的老梗、需要长篇背景才懂的,都不要。\n"
+    "【只输出一个 JSON 数组,不要任何别的字】每个元素形如:\n"
+    '{"phrase":"梗的短句原话","origin":"出处(哪来的、什么事件/剧集/主播/热点)","usage":"什么场合能拿来用、怎么用"}\n'
+    "最多 10 条;实在没查到就输出 []。"
+)
+
+# 把攒下的梗当背景摆给她 —— 关键是「能自然结合才用、不能就别用」,
+# 免得她把梗硬往不相干的话上贴,又尬又出戏。也别说破「我在玩梗」。
+MEME_TPL = (
+    "\n【最近网上的梗(只是备用)】这些是最近流行的梗 / 流行语 / 评论区句式,记在心里:\n"
+    "{items}\n"
+    "用法:只有当话题、气氛正好对得上,才把它顺口揉进你要说的话里,像平时聊天一样自然;"
+    "对不上就别提,宁可用自己的话说 —— 硬凑的梗又尬又出戏,不如不用。"
+    "也别特意解释「我在玩梗」,更别照搬整句,用自己的口气带出来就行。\n"
+)
+
+# 她用了梗之后,读群里接下来这几句反应,判断大家对这梗感不感冒。
+# 判断要保守:「没人接话」不算不感冒,只有明确看出无感 / 尴尬 / 吐槽 / 岔开才算 ——
+# 宁可留着一个她以为大家爱听的梗,也别因为一次冷场就误杀。
+MEME_FEEDBACK_ASK = (
+    "群里一个机器人刚主动用了个梗:「{phrase}」。群里接下来的反应是:\n{chat}\n"
+    "请判断大家对这梗的态度。注意:只是没人接话、或者接着聊别的事去了,那只是没反应,不算不喜欢;"
+    "只有从字里行间能看出「没意思 / 尴尬 / 过时 / 别说了」这类明确的无感或反感,才算不喜欢。\n"
+    "只回答一个词:感冒 或 不感冒。"
+)
+
+# 代码先搜好、直接喂给聊天模型的资料。让它据此回答,免得快模型凭记忆下结论。
+WEB_NOTE_TPL = (
+    "\n\n【代码刚替你联网查过了,这是查到的资料】\n{note}\n"
+    "回答以这些资料为准,别拿记忆里的旧信息下结论;"
+    "资料里没有、或者写着没搜到,就直说没查到,别硬编一个结论出来。"
+    "【先看发布时间,只拿最新的说事】资料里带日期的,挑最近的那条当现状;"
+    "明显是旧日期的(去年、上个月、往届赛事)就别当现在讲 —— "
+    "那件事可能早就结束了(比如世界杯早落幕了,别还在讲谁踢谁);"
+    "要是只有旧消息,就如实说一句「搜到的都是旧消息,可能已经过时了」。"
+    "这份资料就是刚查的,别再多此一举自己再搜一遍(那是白等十几秒)。\n"
 )
 
 
@@ -255,6 +455,14 @@ AMBIENT_TPL = (
 MEMORY_TPL = (
     "\n\n【你记得以前在这个群里聊过这些(不一定跟现在有关)】\n{items}\n"
     "跟眼前的话题沾边就自然带一句,不沾边就别硬提,别提「根据我的记忆」这种话。\n"
+)
+
+# 你自己最近开口说的话。单拎出来是因为别人追问「你刚不是说 XX 吗」时,
+# 光靠短期上下文不稳:聊几句就被刷掉了,重启一次更是全没了。
+SAID_TPL = (
+    "\n\n【你自己最近说过的话(这些就是你说出口的,别否认)】\n{items}\n"
+    "别人追问「你刚才不是说……」时以这里为准:确实说过就认账,"
+    "这儿没有、你也想不起来,才说记不太清,别一口咬定自己没说过。\n"
 )
 
 # 命中关键词时追加一条反应提示(只给方向,别让它照抄这句话)
@@ -367,6 +575,23 @@ def api_fail_reason(resp: dict[str, Any]) -> str:
     return f"QQ 那边拒了(retcode {code})"
 
 
+# 「发张表情包」这种要求,本意是「从本地库里挑一张现成的」,而不是「现画一张」。
+# 但快模型经常理解成「给我做一张表情包」,于是吐 [DRAW] 去生图 —— 又慢又费钱
+# (实测 37~53 秒一次,还按张计费),群里等半天还以为是卡了。
+# 提示词已经在系统约定第 18 条说清了,这里再兜一道:命中「表情包/表情/梗图」
+# 且没同时说要「画/做/合成」的,就归到本地库这条路上。
+STICKER_ASK_RE = re.compile(r"表情包|表情|梗图")
+DRAW_WORD_RE = re.compile(r"画|绘制|生成|做|合成|拼|p图|P图|PS")
+
+
+def wants_local_sticker(text: str) -> bool:
+    """这句是在要「发一张表情包」吗(而且要的不是「画/做一张表情包」)。"""
+    t = str(text or "").strip()
+    if not t or not STICKER_ASK_RE.search(t):
+        return False
+    return not DRAW_WORD_RE.search(t)
+
+
 def split_draw_marker(text: str) -> tuple[str, bool]:
     """找出 `[DRAW]` 标记,返回(标记之后的画面描述, 是否要生图)。
 
@@ -379,19 +604,74 @@ def split_draw_marker(text: str) -> tuple[str, bool]:
     return text[match.end():].strip().strip("`").strip(), True
 
 
+def guess_image_mime(raw: bytes) -> str:
+    """按文件头猜 mime。"""
+    if raw[:4] == b"\x89PNG":
+        return "image/png"
+    if raw[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    if raw[:3] == b"GIF":
+        return "image/gif"
+    return "image/jpeg"
+
+
 def bytes_to_data_url(raw: bytes) -> str:
     """按文件头猜 mime,拼成 data URL。"""
-    if raw[:4] == b"\x89PNG":
-        mime = "image/png"
-    elif raw[:3] == b"\xff\xd8\xff":
-        mime = "image/jpeg"
-    elif raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
-        mime = "image/webp"
-    elif raw[:3] == b"GIF":
-        mime = "image/gif"
-    else:
-        mime = "image/jpeg"
-    return f"data:{mime};base64," + base64.b64encode(raw).decode()
+    return f"data:{guess_image_mime(raw)};base64," + base64.b64encode(raw).decode()
+
+
+# 识图前先把图处理一下:长边超过这个像素就缩,再统一转成 JPEG。
+# 识图按像素多少算钱、也按上传体积等时间 —— GIF 动图压完只剩零头(只留第一帧),
+# 长边 1280 也是个平衡:截图里的报错文字照样看得清,又比原图少一大截像素。
+# 嫌贵就调小(比如 896),代价是截图里的小字可能糊。
+VISION_MAX_EDGE = 1280
+VISION_JPEG_QUALITY = 85
+VISION_CACHE_HOURS = 168  # 同一张图的识图结论留 7 天,期间再发不用重新看
+VISION_CACHE_MAX = 500  # 最多留多少个指纹,超了扔最旧的
+
+
+def shrink_image_for_vision(
+    raw: bytes, max_edge: int = VISION_MAX_EDGE, quality: int = VISION_JPEG_QUALITY
+) -> tuple[bytes, str]:
+    """把要送去识图的图压小,返回(字节, mime)。
+
+    GIF 动图只取第一帧(识图模型本来也只能看一帧),带透明通道的先垫白底(JPEG 没 alpha);
+    长边超 max_edge 再用 LANCZOS 缩下来。压完反而更大(小图)就原样留着,别白折腾。
+    没装 Pillow 或者格式太怪,一律原样返回 —— 压缩这条路坏了也不能把识图带崩。
+    """
+    try:
+        from PIL import Image  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return raw, guess_image_mime(raw)
+    try:
+        im = Image.open(BytesIO(raw))
+        if getattr(im, "is_animated", False):
+            im.seek(0)
+        if "A" in im.getbands():
+            im = im.convert("RGBA")
+            bg = Image.new("RGB", im.size, (255, 255, 255))
+            bg.paste(im, mask=im.split()[-1])
+            im = bg
+        elif im.mode != "RGB":
+            im = im.convert("RGB")
+        w, h = im.size
+        edge = max(w, h)
+        if edge > max_edge:
+            scale = max_edge / float(edge)
+            im = im.resize(
+                (max(1, round(w * scale)), max(1, round(h * scale))), Image.LANCZOS
+            )
+        out = BytesIO()
+        im.save(out, "JPEG", quality=quality, optimize=True)
+        small = out.getvalue()
+        if not small or len(small) >= len(raw):
+            return raw, guess_image_mime(raw)
+        return small, "image/jpeg"
+    except Exception as exc:  # noqa: BLE001
+        log.debug("识图前压缩没成功,用原图:%s", exc)
+        return raw, guess_image_mime(raw)
 
 
 BROWSER_UA = (
@@ -403,6 +683,10 @@ BROWSER_UA = (
 
 DATA_FILE = BASE_DIR / "data.json"  # 积分 / 签到 / 提醒的小存档
 MEMORY_FILE = BASE_DIR / "memory.json"  # 长期记忆:聊天存档
+WEB_CACHE_FILE = BASE_DIR / "search_cache.json"  # 搜过的东西攒着,同一个问题不用反复联网
+VISION_CACHE_FILE = BASE_DIR / "vision_cache.json"  # 识过的图攒着,同一张图不用反复看
+# 她自己生图产物的指纹:这些图绝不能再被当成「表情包」收进库(见 steal_stickers)
+GEN_HASH_FILE = BASE_DIR / "gen_hashes.json"
 
 # 偷表情包:让识图模型仔细判断这张图是不是「聊天用的表情包」,并说清什么时候用。
 # 判断标准写细一点:宁可漏收,也别把照片/截图/商品图收进库里。
@@ -414,7 +698,12 @@ STEAL_PROMPT = (
     "拿不准就当不是,别硬认。\n"
     "想清楚再回,只回一行 JSON,不要任何解释:\n"
     '{"meme":true,"confidence":0.0,"emotion":"核心情绪,4字内",'
-    '"scene":"什么情况/什么时候会发它,20字内","tags":["3到5个检索词"]}\n'
+    '"scene":"什么情况/什么时候会发它,20字内","tags":["只写你百分百确定的标签"]}\n'
+    "tags 只写你**百分百确定**、图上真能看出来、而且确实能当检索词用的。"
+    "只要有一点拿不准,那个标签就别写 —— 宁可少,写错才要命:"
+    "这些标签是用来判断「库里有没有同款」的,错标签会让库里塞满重复的图,也挑不准图。\n"
+    "别凑数(没有就不写、一个也行)、别写同义词堆量、别猜、"
+    "别把「搞笑」「表情包」「图片」这种谁都对得上的废话写进去。\n"
     "确定不是表情包就回:{\"meme\":false}\n"
     "confidence 是 0.0~1.0,你有多确信它是表情包,不确定就往低了打。"
 )
@@ -423,6 +712,11 @@ IMAGE_EXT = {
     "image/gif": ".gif", "image/webp": ".webp", "image/bmp": ".bmp",
 }
 CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+
+# 只 @ 她一下 / 叫一声、或者只甩一串「？？？」这种没实内容的戳,她随口应一句就完。
+# 但同一个人短时间里反复戳,那是在逗她 / 习惯性提醒,不是每次都真想问「怎么了」——
+# 第一次应一声,再来就先不吭声,不然她就成了复读「怎么了？」的机器。
+EMPTY_POKE_REPEAT_SECONDS = 300
 
 # 天气(open-meteo,免费不用 key)和热搜(百度官方)
 GEO_URL = "https://geocoding-api.open-meteo.com/v1/search"
@@ -471,7 +765,7 @@ IDIOM_SEED = [
     "日新月异", "后来居上", "画蛇添足", "井底之蛙", "守株待兔",
 ]
 
-VERSION = "2.3.0"  # 发布版本号,改了记得打个 tag(仓库根目录 VERSION 文件也要同步)
+VERSION = "2.4.0"  # 发布版本号,改了记得打个 tag(仓库根目录 VERSION 文件也要同步)
 
 HELP_TEXT = (
     "小鲸鱼会这些:\n"
@@ -489,6 +783,7 @@ HELP_TEXT = (
     "/热搜      百度实时热搜\n"
     "/统计      今天这个群聊了多少\n"
     "/余额      看还剩多少钱\n"
+    "/撤回      撤自己刚发的一条(引用某条再说「撤回」就撤那条)\n"
     "/表情 [标签]  来张表情包\n"
     "/画 描述   让鲸鲸画一张\n"
     "/搜 问题   联网查\n"
@@ -501,7 +796,7 @@ COMMANDS = {
     "帮助", "help", "菜单", "骰", "骰子", "抽签", "运势", "签到", "打卡", "积分",
     "排行榜", "榜", "猜数字", "猜", "成语接龙", "接龙", "结束", "提醒", "提醒列表",
     "取消提醒", "天气", "热搜", "统计", "余额", "额度", "禁言", "解除禁言", "全体禁言",
-    "踢", "踢人", "版本",
+    "踢", "踢人", "版本", "撤回", "撤销",
 }
 # 这些不用 @ 机器人也能直接触发(画图/搜索/重置沿用原来的处理)
 BYPASS_COMMANDS = COMMANDS | {"画", "搜", "表情", "重置"}
@@ -541,6 +836,10 @@ def strip_at_head(text: str) -> str:
     return re.sub(r"^(?:@\S+\s*|\[CQ:at,[^\]]*\]\s*)+", "", text.strip()).strip()
 
 
+# 两张表情包的标签撞到这个比例以上,就算「同一个使用场合」,只留一张(省地方)
+STICKER_TAG_SIMILAR = 0.6
+
+
 def tag_key(text: str) -> str:
     """把情绪/标签归一化,好比对两张图是不是「同一种情况」。"""
     return re.sub(r"[\s,，。.!！?？~、·\-_/\\()（）]+", "", str(text or "")).lower()
@@ -563,15 +862,6 @@ def natural_command(text: str) -> str:
         if kw in body:
             return cmd
     return ""
-
-
-def find_bl() -> str | None:
-    """找阿里云百炼的命令行工具 bl。PATH 里没有就去默认安装位置翻。"""
-    found = shutil.which("bl")
-    if found:
-        return found
-    guess = Path(os.environ.get("LOCALAPPDATA") or "") / "bailian-cli" / "bin" / "bl.exe"
-    return str(guess) if guess.exists() else None
 
 
 def strip_when(text: str) -> str:
@@ -691,6 +981,79 @@ def polish_reply(text: str, max_chars: int = 0) -> str:
     return body.strip()
 
 
+# 她说话的两条死规矩:每句话句尾挂「喵」,每个断句再挂一个颜文字。
+# 人设提示词里已经这么要求了,这里再兜一道 —— 快模型偶尔会忘,而这是她要的效果。
+NYAN = "喵"
+KAOMOJI_POOL = (
+    "(≧▽≦)", "(´・ω・`)", "(๑•̀ㅂ•́)و✧", "(￣▽￣)", "(๑•́ ₃ •̀๑)",
+    "(｡･ω･｡)", "(＾▽＾)", "(=^･ω･^=)", "٩(ˊᗜˋ)و", "(；´Д｀)",
+    "(*・ω・)", "(´∀｀)", "(・ω・)", "(๑>؂<๑)",
+)
+# 认「这句里已经有颜文字了」用这些字符,不用真去解析括号
+KAOMOJI_CHARS = set("´`ˋˊω・∀≧≦▽△￣＾∇゚ﾟ°·｡✧୧ᗜᐛᴗヮᵕ๑و٩εσヘノつづღ♡")
+# 句尾已经挂着的颜文字单独摘出来,好把「喵」插在它前面
+TAIL_KAO_RE = re.compile(r"[（(【〔][^)）】〕\n]{0,14}[)）】〕]\s*$")
+# 断句:句末标点和换行都算
+SENT_END_RE = re.compile(r"[。！？!?…～~]+")
+_LAST_KAOMOJI = [""]
+
+
+def pick_kaomoji() -> str:
+    """挑一个颜文字。同一个不连着用两次 —— 连着两句挂得一模一样就露馅了。"""
+    pool = [k for k in KAOMOJI_POOL if k != _LAST_KAOMOJI[0]] or list(KAOMOJI_POOL)
+    _LAST_KAOMOJI[0] = random.choice(pool)
+    return _LAST_KAOMOJI[0]
+
+
+def _decorate_clause(chunk: str) -> str:
+    """给一个断句挂上「喵」和颜文字。已经有喵、已经有颜文字的都不重复挂。"""
+    body = chunk.rstrip()
+    if not body:
+        return chunk
+    kao = ""
+    m = TAIL_KAO_RE.search(body)
+    if m:
+        kao = m.group(0).strip()
+        body = body[: m.start()].rstrip()
+        if not body:  # 整句就是个颜文字,那就原样发
+            return chunk
+    # 句末标点先摘掉(「……」也一并摘),问号叹号留着挂到喵后面
+    m = SENT_END_RE.search(body)
+    if m and m.end() == len(body):
+        tail = m.group(0)
+        keep = "?" if ("?" in tail or "？" in tail) else ("!" if ("!" in tail or "！" in tail) else "")
+        body = body[: m.start()].rstrip()
+    else:
+        keep = ""
+    if not body:
+        return chunk
+    if not body.endswith(NYAN):
+        body += NYAN
+    out = body + keep
+    if not kao and not any(c in KAOMOJI_CHARS for c in out):
+        kao = pick_kaomoji()
+    return out + (" " + kao if kao else "")
+
+
+def decorate_speech(text: str) -> str:
+    """把要说的话按断句挂上「喵」+ 颜文字。一行算一句,行内再按句末标点断。"""
+    lines: list[str] = []
+    for line in str(text).split("\n"):
+        if not line.strip():
+            lines.append(line)
+            continue
+        pieces: list[str] = []
+        start = 0
+        for m in SENT_END_RE.finditer(line):
+            # 标点后面还有字才算一个断句,行尾那个标点留在本句里
+            if line[m.end():].strip():
+                pieces.append(line[start: m.end()])
+                start = m.end()
+        pieces.append(line[start:])
+        lines.append("".join(_decorate_clause(p) if p.strip() else p for p in pieces))
+    return "\n".join(lines)
+
+
 class Store:
     """很小的本地存档:积分 / 签到 / 提醒。坏了就当空的,不能让机器人起不来。"""
 
@@ -740,16 +1103,46 @@ class Store:
         return items[:top]
 
 
+# 长期记忆每条存多长。默认跟 reply_max_chars(300)对齐,再多就截断。
+MEMORY_MAX_CHARS = 300
+# 同一件事最多算「被提过几次」。每多提一次记性翻倍,到顶就不再加。
+MEMORY_HITS_CAP = 6
+# 自己说过的话记性更好(人对自己做过的事记得更牢),衰减稳定性翻倍。
+SELF_SAID_BOOST = 2.0
+
+
 class Memory:
     """轻量长期记忆:按会话把聊天存档,再用关键词捞回来。
 
     没上向量库(RAG)——那个得额外跑数据库。这里就是存文本 + 两个字两个字地比对,
     应付「上次说的那个东西」这种指代够用了。
+
+    遗忘照着人的样子来:
+      · 三天之内(full_days)说过的话一句都不许忘 —— 这段时间是完整记录;
+      · 三天之前的按艾宾浩斯曲线往下掉,还活着的概率 = exp(-(过了几天-3) / 稳定性);
+      · 同一件事被反复提起,稳定性翻倍 —— 这就是「多次提及的东西记得住」;
+      · 自己说出口的话记性更好(人对自己做过的事记得更牢),稳定性也翻倍。
+    每条存进来的时候掷一次骰子(luck),掷完就定死。所以一件旧事要么记着、要么忘了,
+    不会一会儿想起来一会儿想不起来 —— 那不像人,像 bug。
+
+    忘了的条目会真的从 memory.json 里划掉(见 prune)。以前是「读的时候过滤掉」,
+    条目本身一直躺在硬盘上,文件只涨不缩 —— 那不算忘,那叫藏起来。
     """
 
-    def __init__(self, path: Path, keep_days: int = 30) -> None:
+    def __init__(
+        self,
+        path: Path,
+        keep_days: int = 30,
+        full_days: float = 3,
+        decay_days: float = 7,
+        self_names: set[str] | None = None,
+    ) -> None:
         self.path = path
         self.keep_days = keep_days
+        self.full_days = max(0.0, float(full_days))
+        self.decay_days = max(1.0, float(decay_days))
+        # 哪些名字算「她自己」——她说的话衰减得慢,删的时候也得按这个标准来
+        self.self_names = set(self_names or set())
         self.data: dict[str, list[list[Any]]] = {}
         self.dirty = False
         self.last_save = 0.0
@@ -759,22 +1152,126 @@ class Memory:
                 self.data = raw
         except Exception:  # noqa: BLE001
             self.data = {}
+        # 老存档每条只有 [时间, 谁, 说了啥],把后两格补上(骰子 + 被提过几次)
+        patched = False
+        for rows in self.data.values():
+            for row in rows:
+                if isinstance(row, list) and len(row) == 3:
+                    row.extend([random.random(), 1])
+                    patched = True
+        if patched:
+            self.dirty = True
+
+    @staticmethod
+    def _norm(text: str) -> str:
+        """比「是不是同一件事」时先去掉空白,别让空格和换行搅和。"""
+        return re.sub(r"\s+", "", str(text))
+
+    def _alive(self, row: list[Any], now: float, self_boost: float = 1.0) -> bool:
+        """这条还记得住吗。三天之内必在;再往前就按艾宾浩斯曲线往下掉。"""
+        age = (now - float(row[0])) / 86400.0
+        if age <= self.full_days:
+            return True
+        hits = min(max(int(row[4]), 1), MEMORY_HITS_CAP)
+        stability = self.decay_days * self_boost * (2 ** (hits - 1))
+        return float(row[3]) <= math.exp(-(age - self.full_days) / stability)
+
+    def prune(self, now: float | None = None) -> int:
+        """把已经想不起来的旧账真的从存档里删掉,返回删了几条。
+
+        遗忘得发生在硬盘上 —— 只把条目留着一辈子,读的时候假装看不见,那文件只会越堆越大。
+        判断标准跟捞记忆时完全一样,而且挑最宽松的那一档(自己说的话稳定性翻倍):
+        一条记录只有在「所有能把它捞出来的路子」都已经捞不着了,才算真忘,才肯删。
+        三天以内的记录一律不碰,所以刚聊完的东西不会被误伤。
+        """
+        now = time.time() if now is None else now
+        gone = 0
+        for key in list(self.data.keys()):
+            rows = self.data[key]
+            kept: list[list[Any]] = []
+            for row in rows:
+                # 格子不全的老数据判不了,先留着,别乱删
+                if len(row) < 5:
+                    kept.append(row)
+                    continue
+                boost = SELF_SAID_BOOST if str(row[1]) in self.self_names else 1.0
+                if self._alive(row, now, boost):
+                    kept.append(row)
+                else:
+                    gone += 1
+            if len(kept) != len(rows):
+                self.data[key] = kept
+            if not kept:
+                del self.data[key]
+        if gone:
+            self.dirty = True
+            log.info("忘掉 %d 条已经想不起来的旧账(从 memory.json 里删掉了)", gone)
+        return gone
 
     def add(self, session_key: str, who: str, text: str) -> None:
         text = text.strip()
-        if not text or len(text) > 200:
+        if not text:
             return
+        # 太长就截一段存,不能整条扔。以前超过 200 字直接丢弃,可她自己回的话
+        # 最长能到 reply_max_chars(默认 300)—— 恰恰是信息量大的长回答存不进去,
+        # 回头别人问「你刚不是说…」她就真没得捞,只能死不认账。
+        if len(text) > MEMORY_MAX_CHARS:
+            text = text[:MEMORY_MAX_CHARS] + "…"
         rows = self.data.setdefault(session_key, [])
-        rows.append([time.time(), who, text])
+        # 同一件事又提了一遍 → 之前那条也涨牢度,这才是人记东西的样子
+        body = self._norm(text)
+        repeats = 0
+        for row in rows[-1000:]:
+            if len(row) < 5:
+                continue
+            other = self._norm(row[2])
+            if other == body:
+                hit = True
+            elif len(other) >= 4 and len(body) >= 4:
+                hit = body in other or other in body
+            else:
+                hit = False
+            if hit:
+                row[4] = min(int(row[4]) + 1, MEMORY_HITS_CAP)
+                repeats += 1
+        rows.append(
+            [time.time(), who, text, random.random(), min(1 + repeats, MEMORY_HITS_CAP)]
+        )
         cutoff = time.time() - self.keep_days * 86400
         if len(rows) > 2000 or rows[0][0] < cutoff:
             self.data[session_key] = [r for r in rows if r[0] >= cutoff][-2000:]
         self.dirty = True
 
+    def recent_said(
+        self, session_key: str, who: str, limit: int = 5, self_boost: float = SELF_SAID_BOOST
+    ) -> list[str]:
+        """倒着捞她自己最近说过的话。
+
+        不受时间窗限制 —— 刚说完的恰恰最要紧,而这会儿她的话很可能已经被
+        短期历史刷掉了(或者重启过一次,历史整个没了)。
+        但也不是铁打的:三天之前照样会淡,只是淡得比别人说的慢(自己说的话记得更牢)。
+        """
+        rows = self.data.get(session_key) or []
+        now = time.time()
+        out: list[str] = []
+        for row in reversed(rows):
+            if len(row) < 5 or str(row[1]) != who:
+                continue
+            if not self._alive(row, now, self_boost):
+                continue
+            out.append(str(row[2]))
+            if len(out) >= limit:
+                break
+        return list(reversed(out))
+
     def search(
         self, session_key: str, query: str, limit: int = 4, skip_recent: int = 600
     ) -> list[str]:
-        """找跟这句话有关的旧聊天,返回「谁: 说了啥」。"""
+        """找跟这句话有关的旧聊天,返回「谁: 说了啥」。
+
+        三天内的记录一定捞得到;再往前的那些,掷骰子时没活下来的就当想不起来了,
+        压根不往外捞 —— 省得她一本正经地讲出早该忘掉的事。
+        """
         rows = self.data.get(session_key) or []
         grams = {
             query[i : i + 2]
@@ -783,15 +1280,23 @@ class Memory:
         }
         if not grams:
             return []
+        now = time.time()
         # 刚聊完的还在上下文里,不用重复喂
-        cutoff = time.time() - skip_recent
-        scored: list[tuple[int, str]] = []
-        for ts, who, text in rows[-1000:]:
-            if ts > cutoff:
+        cutoff = now - skip_recent
+        scored: list[tuple[float, str]] = []
+        for row in rows[-1000:]:
+            if len(row) < 5:
+                continue
+            ts, who, text = float(row[0]), row[1], row[2]
+            if ts > cutoff or not self._alive(row, now):
                 continue
             score = sum(text.count(g) for g in grams)
-            if score:
-                scored.append((score, f"{who}: {text}"))
+            if not score:
+                continue
+            if now - ts <= self.full_days * 86400:
+                score += 3  # 三天内的往上顶:这段时间的事不该想不起来
+            score += max(min(int(row[4]), MEMORY_HITS_CAP) - 1, 0)  # 反复提过的更打眼
+            scored.append((score, f"{who}: {text}"))
         if not scored:
             return []
         scored.sort(key=lambda item: -item[0])
@@ -804,7 +1309,9 @@ class Memory:
         return out
 
     def save(self, force: bool = False) -> None:
-        """攒一会儿再写盘,别每条消息都写一次。"""
+        """攒一会儿再写盘,别每条消息都写一次。写之前先把真忘掉的条目划掉。"""
+        # 先清理再落盘:遗忘了的东西必须真的从硬盘上消失,不能只是读的时候假装看不见。
+        self.prune()
         if not self.dirty:
             return
         now = time.time()
@@ -818,6 +1325,141 @@ class Memory:
             tmp.replace(self.path)
         except Exception as exc:  # noqa: BLE001
             log.warning("记忆写不进去:%s", exc)
+
+
+# 搜索缓存的 TTL:强时效性(比分、谁赢了、最新版本)过几个小时就得重搜,
+# 免得拿昨天的比分答今天的比赛;普通资料可以多存一天。
+WEB_FRESH_HOURS = 6
+WEB_PLAIN_HOURS = 24
+WEB_CACHE_MAX = 300  # 最多留多少条,超了扔最旧的
+
+
+class WebCache:
+    """把搜到过的答案攒下来,同一个问题不用每次重新联网。
+
+    每次问「VIT 和 100T 谁赢了」都要联网搜一遍,又慢又费钱 —— 而且同一个问题
+    群里可能一会儿问三遍。这里按归一化后的问题存一份结果,命中就直接拿出来用。
+    时效性的(比分/最新)只保留几小时,过点自动当没有、重新搜,不会拿旧答案硬答。
+    """
+
+    def __init__(
+        self,
+        path: Path,
+        fresh_hours: float = WEB_FRESH_HOURS,
+        plain_hours: float = WEB_PLAIN_HOURS,
+    ) -> None:
+        self.path = path
+        self.fresh_ttl = max(60.0, float(fresh_hours) * 3600)
+        self.plain_ttl = max(60.0, float(plain_hours) * 3600)
+        self.data: dict[str, list[Any]] = {}
+        self.dirty = False
+        self.last_save = 0.0
+        try:
+            raw = json.loads(path.read_text("utf-8"))
+            if isinstance(raw, dict):
+                self.data = raw
+        except Exception:  # noqa: BLE001
+            self.data = {}
+
+    @staticmethod
+    def _key(query: str) -> str:
+        """同一个问题换个问法(空格、大小写、标点)也该命中,先归一化再当 key。"""
+        return re.sub(r"[\s,，。.?!？！~`'\"“”‘’、]+", "", str(query)).lower()
+
+    def get(self, query: str) -> str:
+        """命中了就返回上次搜到的原文,没有(或过期)就返回空串。"""
+        row = self.data.get(self._key(query))
+        if not isinstance(row, list) or len(row) < 3:
+            return ""
+        ts, text = float(row[0]), str(row[1])
+        ttl = self.fresh_ttl if row[2] else self.plain_ttl
+        if time.time() - ts > ttl:
+            return ""
+        return text
+
+    def put(self, query: str, text: str, fresh: bool) -> None:
+        text = str(text).strip()
+        if not text:
+            return  # 没搜到就别存,不然以后一直拿「没搜到」当答案
+        self.data[self._key(query)] = [time.time(), text, bool(fresh)]
+        if len(self.data) > WEB_CACHE_MAX:
+            keep = sorted(self.data.items(), key=lambda kv: -float(kv[1][0]))[:WEB_CACHE_MAX]
+            self.data = dict(keep)
+        self.dirty = True
+
+    def save(self, force: bool = False) -> None:
+        if not self.dirty:
+            return
+        now = time.time()
+        if not force and now - self.last_save < 30:
+            return
+        self.last_save = now
+        self.dirty = False
+        try:
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self.path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("搜索缓存写不进去:%s", exc)
+
+
+class VisionCache:
+    """同一张图识过了就把结论记下来,再发一遍不用重新花钱看。
+
+    最烧钱的是那些「不是表情包」的图(照片、截图、商品图):它们收不进库,
+    所以永远进不了 known_hashes,群里每被发一次就重新识一遍 —— 又慢又费。
+    这里按图片指纹存一份识图结论,命中就直接拿上次的,省一趟接口往返。
+    """
+
+    def __init__(self, path: Path, hours: float = VISION_CACHE_HOURS) -> None:
+        self.path = path
+        self.ttl = max(60.0, float(hours) * 3600)
+        self.data: dict[str, list[Any]] = {}
+        self.dirty = False
+        self.last_save = 0.0
+        try:
+            raw = json.loads(path.read_text("utf-8"))
+            if isinstance(raw, dict):
+                self.data = raw
+        except Exception:  # noqa: BLE001
+            self.data = {}
+
+    def get(self, digest: str) -> str:
+        """命中了就返回上次识图的原文,没有(或过期)就返回空串。"""
+        row = self.data.get(digest)
+        if not isinstance(row, list) or len(row) < 2:
+            return ""
+        ts, text = float(row[0]), str(row[1])
+        if time.time() - ts > self.ttl:
+            del self.data[digest]
+            self.dirty = True
+            return ""
+        return text
+
+    def put(self, digest: str, text: str) -> None:
+        text = str(text).strip()
+        if not text:
+            return  # 没识出东西(接口抽风/返回空)就别存,免得以后一直拿它当结论
+        self.data[digest] = [time.time(), text]
+        if len(self.data) > VISION_CACHE_MAX:
+            keep = sorted(self.data.items(), key=lambda kv: -float(kv[1][0]))[:VISION_CACHE_MAX]
+            self.data = dict(keep)
+        self.dirty = True
+
+    def save(self, force: bool = False) -> None:
+        if not self.dirty:
+            return
+        now = time.time()
+        if not force and now - self.last_save < 30:
+            return
+        self.last_save = now
+        self.dirty = False
+        try:
+            tmp = self.path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self.data, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(self.path)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("识图缓存写不进去:%s", exc)
 
 
 def load_config() -> dict[str, Any]:
@@ -846,11 +1488,26 @@ class Bot:
         # 每个会话最近发过的表情包,免得老是甩同一张
         self.recent_stickers: dict[str, list[str]] = defaultdict(list)
         # 本地表情包库(读不到就是空的,功能自动隐身)
-        self.stickers, self.sticker_tags = self._load_stickers()
+        self.stickers, _ = self._load_stickers()
         # 最近一次收到任何消息的时间,NapCat 每 30 秒会推心跳,拿它判断连接死没死
         self.last_msg_at = time.time()
         # 群里没点它的话,也顺手记下来当背景,不然它不知道群里在聊什么
         self.ambient: dict[str, list[str]] = defaultdict(list)
+        # 「用户爱聊什么」:每个会话里反复出现的词 -> [出现过几条消息, 最后出现时间, 说过的人]
+        self.topic_hits: dict[str, dict[str, list[Any]]] = defaultdict(dict)
+        # 提前替群里搜好的话题资料:会话 -> 话题 -> [搜的时间, 资料原文]
+        self.topic_briefs: dict[str, dict[str, list[Any]]] = defaultdict(dict)
+        # 每天最多提前搜几次(烧额度有天花板)
+        self.topic_prefetch: dict[str, Any] = {"day": "", "n": 0}
+        self._load_topics()
+        # 网上攒下的梗:每项 {"phrase","origin","usage","first_seen","last_seen"};说的时候她自己挑着用
+        self.memes: list[dict[str, Any]] = []
+        self.meme_last = 0.0  # 上次上网搜梗的时间(隔 meme_search_hours 才再搜)
+        # 被群友「不太感冒」否掉的梗:phrase -> 拉黑时间。以后不再注入、搜到也过滤掉
+        self.meme_rejected: dict[str, float] = {}
+        # 她刚用了某个梗、正等群里反应:会话 -> {"phrase","t","collected"}
+        self.meme_watch: dict[str, dict[str, Any]] = {}
+        self._load_memes()
         # 群功能:积分和提醒存本地,游戏状态和防撤回缓存只在内存
         self.store = Store(DATA_FILE)
         self.games: dict[str, dict[str, Any]] = {}
@@ -862,8 +1519,25 @@ class Bot:
         self.repeated: set[str] = set()
         # call_api_wait 等回包用
         self.pending: dict[str, asyncio.Future] = {}
-        # 长期记忆:把聊天存档,以后能捞回来
-        self.memory = Memory(MEMORY_FILE, int(cfg.get("memory_days", 30)))
+        # 长期记忆:把聊天存档,以后能捞回来。三天内一句不忘,再往前按人的样子慢慢淡,
+        # 淡没了的会真从 memory.json 里删掉(不是留着只是不显示)
+        self.memory = Memory(
+            MEMORY_FILE,
+            int(cfg.get("memory_days", 30)),
+            cfg.get("memory_full_days", 3),
+            cfg.get("memory_decay_days", 7),
+            self_names=set(self.bot_names()),
+        )
+        # 搜过的东西记一份:同一个问题再来就直接用,不用重新联网(快很多)
+        self.web_cache = WebCache(
+            WEB_CACHE_FILE,
+            cfg.get("search_cache_fresh_hours", WEB_FRESH_HOURS),
+            cfg.get("search_cache_hours", WEB_PLAIN_HOURS),
+        )
+        # 识过的图记一份:同一张再被发进群,直接拿上次的结论,不用重新花钱看一遍
+        self.vision_cache = VisionCache(
+            VISION_CACHE_FILE, cfg.get("vision_cache_hours", VISION_CACHE_HOURS)
+        )
         # 群统计 / 日报 / 主动消息
         self.stats: dict[str, dict[str, Any]] = {}
         self.day_log: dict[str, list[str]] = defaultdict(list)
@@ -872,6 +1546,8 @@ class Bot:
         self.proactive_backoff: dict[str, int] = {}
         # 接话窗里只认「刚才跟她对话的那个人」:别人插话不算冲她说的
         self.followup_partner: dict[str, str] = {}
+        # 已经靠接话窗连着回了这个人几句。到顶就停,不然她一开口就变成「群里每一条都回」
+        self.followup_streak: dict[str, int] = {}
         # 没人叫它、它自己插话的时间点,免得连着搭话刷屏
         self.last_chime: dict[str, float] = {}
         # 她最近一次在群里说话的时刻,用来开「接话窗」:刚聊完那一小会儿,别人接着说的短句也理
@@ -884,10 +1560,22 @@ class Bot:
         self.reported_day = ""
         self.steal_count: dict[str, Any] = {"day": "", "n": 0}
         self.known_hashes: set[str] = self._hash_stickers()
-        # 试收过的图指纹 -> 见过几次。见得够多才认为是真表情包,别把截图也收了
+        # 她自己生图产出的图,指纹存这儿。这些是「画」出来的,不是表情包,
+        # 绝不能被 steal_stickers 当成聊天表情收进库(见那条硬规则)
+        self.gen_hashes: set[str] = self._load_gen_hashes()
+        # 她自己发出去的每条消息的 message_id(按会话/群记最近若干条):要能撤回自己刚说的话。
+        # 只留最近 20 条,内存不会只涨不缩
+        self.bot_msgs: dict[str, deque[tuple[float, str]]] = defaultdict(
+            lambda: deque(maxlen=20)
+        )
+        # 试收过的图指纹 -> 见过几次(steal_min_seen 想调回「见过几次才收」时用得上)
         self.seen_counts: dict[str, int] = {}
+        # 今天为了偷图花了多少次识图调用。识图要钱,给个天花板兜底
+        self.steal_vision: dict[str, Any] = {"day": "", "n": 0}
         # 她说过话之后,群里连着多少条没人理她(数够了就先闭嘴)
         self.silent_streak: dict[str, int] = {}
+        # 谁刚戳过她(会话+人 -> 时刻)。同一个人反复空 @ 就不每次都回「怎么了」了
+        self.poked_at: dict[str, float] = {}
         self.said_at: dict[str, float] = {}
         # 本条消息命中的关键词反应,用完就丢
         self.reaction: dict[str, str] = {}
@@ -902,6 +1590,33 @@ class Bot:
             except Exception:  # noqa: BLE001
                 continue
         return out
+
+    def _load_gen_hashes(self) -> set[str]:
+        """读她自己生图产物的指纹存档(读不到就是空的)。"""
+        try:
+            raw = json.loads(GEN_HASH_FILE.read_text("utf-8"))
+            if isinstance(raw, list):
+                return {str(x) for x in raw}
+        except Exception:  # noqa: BLE001
+            pass
+        return set()
+
+    def _remember_gen_image(self, raw: bytes) -> None:
+        """记下她刚生出来的这张图的指纹 —— 以后谁把它转发进群,也不会被当成表情包收走。"""
+        if not raw:
+            return
+        digest = hashlib.md5(raw).hexdigest()
+        if digest in self.gen_hashes:
+            return
+        self.gen_hashes.add(digest)
+        try:
+            tmp = GEN_HASH_FILE.with_suffix(".tmp")
+            # 只留最近 500 条,文件别只涨不缩
+            items = list(self.gen_hashes)[-500:]
+            tmp.write_text(json.dumps(items, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(GEN_HASH_FILE)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("生图指纹写不进去:%s", exc)
 
     # ---------- 表情包 ----------
 
@@ -990,6 +1705,508 @@ class Bot:
         buf.append(line[:100])
         del buf[:-keep]
 
+    def recent_topic(self, session_key: str, limit: int = 4) -> str:
+        """群里最近在聊什么,给搜索定个语境。
+
+        取最近几条背景消息(没点她的那些),把发言人昵称去掉、拼成一句短语。
+        搜索时带上它,「ZMJJKK 和 LUKXO」就不会被按字面当成两个足球/网球运动员。
+        """
+        lines = self.ambient.get(session_key) or []
+        if not lines:
+            return ""
+        tail: list[str] = []
+        for line in lines[-limit:]:
+            body = line.split(":", 1)[-1] if ":" in line else line
+            body = body.replace("[图片]", "").strip()
+            if body:
+                tail.append(body)
+        return " / ".join(tail)[-100:]
+
+    # ---------- 用户爱聊什么(常聊话题) ----------
+
+    def _load_topics(self) -> None:
+        """读上次攒下的常聊话题和提前搜好的资料(读不到就从头攒)。"""
+        try:
+            raw = json.loads(TOPIC_CACHE_FILE.read_text("utf-8"))
+        except Exception:  # noqa: BLE001
+            return
+        if not isinstance(raw, dict):
+            return
+        hits = raw.get("hits")
+        if isinstance(hits, dict):
+            for session_key, terms in hits.items():
+                if isinstance(terms, dict):
+                    rows: dict[str, list[Any]] = {}
+                    for t, v in terms.items():
+                        if isinstance(v, list) and len(v) >= 2:
+                            first = float(v[3]) if len(v) >= 4 else float(v[1])
+                            users = list(v[2]) if len(v) >= 3 else []
+                            rows[str(t)] = [int(v[0]), float(v[1]), users, first]
+                    self.topic_hits[session_key] = rows
+        briefs = raw.get("briefs")
+        if isinstance(briefs, dict):
+            for session_key, terms in briefs.items():
+                if isinstance(terms, dict):
+                    self.topic_briefs[session_key] = {
+                        str(t): [float(v[0]), str(v[1])]
+                        for t, v in terms.items()
+                        if isinstance(v, list) and len(v) >= 2
+                    }
+
+    def _save_topics(self) -> None:
+        try:
+            tmp = TOPIC_CACHE_FILE.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(
+                    {"hits": self.topic_hits, "briefs": self.topic_briefs},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            tmp.replace(TOPIC_CACHE_FILE)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("话题缓存写不进去:%s", exc)
+
+    @staticmethod
+    def _topic_terms(text: str) -> list[str]:
+        """从一句话里切出可能的话题词:中文按 2~4 字滑动切,英文/数字整段留。
+
+        切得糙没关系 —— 反复出现的自然会被顶上来,出现一次的没人搭理。
+        """
+        clean = re.sub(r"https?://\S+", " ", str(text)).replace("[图片]", " ")
+        out: list[str] = []
+        for run in TOPIC_TERM_RE.findall(clean):
+            if run[0].isascii():
+                out.append(run.lower())
+                continue
+            for size in (2, 3, 4):
+                if size > len(run):
+                    break
+                for i in range(0, len(run) - size + 1):
+                    term = run[i : i + size]
+                    if term not in TOPIC_STOPWORDS:
+                        out.append(term)
+        return out
+
+    def observe_topic(self, session_key: str, user_id: str, text: str) -> None:
+        """记一笔群里在聊什么。反反复复出现的词,就是「用户爱聊什么」。"""
+        hits = self.topic_hits[session_key]
+        now = time.time()
+        uid = str(user_id or "")
+        for term in set(self._topic_terms(text)):
+            row = hits.get(term)
+            if row is None:
+                # [出现过几条消息, 最后出现时间, 说过的人, 第一次出现时间]
+                hits[term] = [1, now, [uid], now]
+            else:
+                row[0] = int(row[0]) + 1
+                row[1] = now
+                if len(row) < 4:  # 老存档没有「第一次出现时间」,补上
+                    row.append(now)
+                if uid and uid not in row[2]:
+                    row[2].append(uid)
+        # 很久没人提的词直接扔,别越攒越多(话题的热度能撑好些天,默认留 15 天)
+        forget = float(self.cfg.get("topic_forget_hours", 360)) * 3600
+        for term in [t for t, r in hits.items() if now - float(r[1]) > forget]:
+            del hits[term]
+        if len(hits) > 400:
+            for term, _ in sorted(hits.items(), key=lambda kv: int(kv[1][0]))[: len(hits) - 400]:
+                del hits[term]
+
+    def hot_topics(self, session_key: str, limit: int | None = None) -> list[str]:
+        """这个会话里反复出现、值得提前去搜的词。
+
+        按「出现次数」排,次数一样就挑更长的那个 —— 因为「无畏契约」被切出来的
+        「无畏」「契约」跟它的次数一模一样,不挑长的永远轮不到它。
+        同一个话题的碎片(长的包含短的)只留一个,免得为一个话题搜三遍。
+        """
+        hits = self.topic_hits.get(session_key) or {}
+        min_hits = int(self.cfg.get("topic_hot_min", TOPIC_HOT_MIN))
+        # 调用方没点名要几个,就按配置来(topic_max);点名了(比如「报一下群里的热点话题」
+        # 想要前 5 个)就以调用方为准
+        if limit is None:
+            limit = int(self.cfg.get("topic_max", TOPIC_MAX))
+        ranked = sorted(
+            hits.items(),
+            key=lambda kv: (-int(kv[1][0]), -len(kv[0]), -len(kv[1][2]), kv[0]),
+        )
+        picked: list[str] = []
+        for term, row in ranked:
+            if int(row[0]) < min_hits:
+                break
+            # 停用词在切词时已经挡过一道;这里再挡一道,免得改之前攒下的旧垃圾词
+            # (口头语、纯时间词)还留在存档里,被报成「常聊话题」或者拿去搜
+            if term in TOPIC_STOPWORDS:
+                continue
+            if any(term in p or p in term for p in picked):
+                continue
+            picked.append(term)
+            if len(picked) >= limit:
+                break
+        return picked
+
+    def topic_report(self, session_key: str) -> str:
+        """本群最近反复在聊什么 —— 给「群里有什么热点话题 / 最近在聊啥」这类问题用。
+
+        话题还没攒够(凑不满 topic_hot_min)就返回空串,让调用方自己决定怎么答,别硬编。
+        """
+        topics = self.hot_topics(session_key, limit=5)
+        if not topics:
+            return ""
+        inner = "、".join(f"「{t}」" for t in topics)
+        return f"最近群里聊得最多的是 {inner}"
+
+    def topic_interval(self, session_key: str, topic: str) -> float:
+        """这个话题该隔多久搜一次(顺便也是资料能放多久)。
+
+        话题活得越久,搜得越稀 —— 刚冒出来的最勤一天一次,活了好几个月的一周一次就够了。
+        道理很直白:一个话题在群里活了大半年,该知道的群里早知道了,
+        再搜也搜不出什么新鲜的,白花钱。
+
+        hours = `topic_fresh_hours` × (活了几天 + 1) ^ 0.43,夹在 [刷新频率, 周频率] 之间。
+        指数 0.43 是配着来的:刚出来(0 天)正好一天一次,活到 90 天(约三个月)正好顶到一周一次。
+        """
+        fresh = float(self.cfg.get("topic_fresh_hours", 24))
+        old = float(self.cfg.get("topic_old_hours", 168))
+        row = (self.topic_hits.get(session_key) or {}).get(topic)
+        if not row:
+            return fresh * 3600
+        first = float(row[3]) if len(row) > 3 else float(row[1])
+        age_days = max(0.0, (time.time() - first) / 86400.0)
+        hours = fresh * (age_days + 1) ** TOPIC_AGE_POW
+        return min(max(hours, fresh), old) * 3600
+
+    def prefetched_note(self, session_key: str, text: str) -> tuple[str, str]:
+        """问的东西正好落在某个常聊话题上,有没有提前搜好的资料。
+
+        有就返回 (话题, 资料原文),没有就返回空 —— 空的话照旧当场联网搜。
+        问题里没直接点名话题、但用了英文名/缩写(比如 ZMJJKK),那就看群里最近在聊什么,
+        对得上也算命中。别的不相关的问题(比如问天气)不会被话题带跑。
+        """
+        briefs = self.topic_briefs.get(session_key) or {}
+        if not briefs:
+            return "", ""
+        low = str(text).lower()
+        # 问题里带了英文名/缩写这种「需要靠上下文才能认出来」的东西
+        loose = bool(re.search(r"[A-Za-z0-9_]{3,}", str(text)))
+        ambient = self.recent_topic(session_key) if loose else ""
+        now = time.time()
+        for topic in sorted(briefs, key=lambda t: -float(briefs[t][0])):
+            if now - float(briefs[topic][0]) > self.topic_interval(session_key, topic):
+                continue
+            if topic and topic.lower() in low:
+                return topic, str(briefs[topic][1])
+            if ambient and topic and topic in ambient:
+                return topic, str(briefs[topic][1])
+        return "", ""
+
+    def topic_background(self, session_key: str, limit: int = 1) -> str:
+        """把提前搜好的话题资料摆成一小段背景(没搜过就空着)。"""
+        briefs = self.topic_briefs.get(session_key) or {}
+        now = time.time()
+        items: list[str] = []
+        for topic in sorted(briefs, key=lambda t: -float(briefs[t][0])):
+            if len(items) >= limit:
+                break
+            if now - float(briefs[topic][0]) > self.topic_interval(session_key, topic):
+                continue
+            items.append(f"关于「{topic}」:{str(briefs[topic][1])[:300]}")
+        return "\n".join(items)
+
+    async def prefetch_topics(self) -> None:
+        """替群里把常聊话题提前搜好,聊到时直接拿现成的,不用当场等十几秒。"""
+        if not self.cfg.get("topic_prefetch", True):
+            return
+        today = datetime.now().strftime("%Y-%m-%d")
+        if self.topic_prefetch.get("day") != today:
+            self.topic_prefetch = {"day": today, "n": 0}
+        budget = int(self.cfg.get("topic_prefetch_per_day", 12))
+        now = time.time()
+        for session_key in list(self.topic_hits.keys()):
+            for topic in self.hot_topics(session_key):
+                if int(self.topic_prefetch["n"]) >= budget:
+                    self._prune_topic_briefs()
+                    self._save_topics()
+                    return
+                brief = (self.topic_briefs.get(session_key) or {}).get(topic)
+                # 还没到这个话题该搜的间隔就跳过(话题越老,间隔越长)
+                if brief and now - float(brief[0]) < self.topic_interval(session_key, topic):
+                    continue
+                log.info("提前替群里搜一下常聊话题:%s", topic)
+                try:
+                    # 话题预热是后台活儿,走便宜档就行,别拿主力搜索模型(要钱)去磨
+                    note = await self.tool_web_search(
+                        f"{topic} 最新消息",
+                        session_key,
+                        str(self.cfg.get("topic_search_model") or ""),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("预热话题失败(%s):%s", topic, exc)
+                    continue
+                if note and not note.startswith(("没搜到", "搜索没连上")):
+                    self.topic_briefs[session_key][topic] = [time.time(), note]
+                    self.topic_prefetch["n"] = int(self.topic_prefetch["n"]) + 1
+        self._prune_topic_briefs()
+        self._save_topics()
+
+    def _prune_topic_briefs(self) -> None:
+        """话题早没人提了,提前搜的资料也跟着删掉 —— 这就叫「很久没提就删了」。"""
+        for session_key in list(self.topic_briefs.keys()):
+            live = set(self.topic_hits.get(session_key) or {})
+            briefs = self.topic_briefs[session_key]
+            for topic in [t for t in briefs if t not in live]:
+                del briefs[topic]
+            if not briefs:
+                del self.topic_briefs[session_key]
+
+    async def topic_loop(self) -> None:
+        """每隔一阵子,替群里把常聊话题提前搜好,省得聊到时当场等。"""
+        while True:
+            await asyncio.sleep(float(self.cfg.get("topic_prefetch_minutes", 20)) * 60)
+            try:
+                await self.prefetch_topics()
+            except Exception:  # noqa: BLE001
+                log.exception("话题预热出错")
+            try:
+                await self._prefetch_memes()
+            except Exception:  # noqa: BLE001
+                log.exception("预热梗出错")
+
+    # ---------- 网上的梗 ----------
+
+    def _load_memes(self) -> None:
+        """读上次攒下的梗(读不到就从头攒)。"""
+        try:
+            raw = json.loads(MEME_CACHE_FILE.read_text("utf-8"))
+        except Exception:  # noqa: BLE001
+            return
+        if not isinstance(raw, dict):
+            return
+        items = raw.get("memes")
+        if isinstance(items, list):
+            for m in items:
+                if not isinstance(m, dict):
+                    continue
+                phrase = str(m.get("phrase") or "").strip()
+                if not phrase:
+                    continue
+                self.memes.append(
+                    {
+                        "phrase": phrase[:40],
+                        "origin": str(m.get("origin") or "").strip()[:80],
+                        "usage": str(m.get("usage") or "").strip()[:80],
+                        "first_seen": float(m.get("first_seen") or 0),
+                        # 老存档没有 last_seen:拿 first_seen 顶上,免得一升级全被判过期
+                        "last_seen": float(
+                            m.get("last_seen") or m.get("first_seen") or 0
+                        ),
+                    }
+                )
+        rejected = raw.get("rejected")
+        if isinstance(rejected, dict):
+            for phrase, ts in rejected.items():
+                self.meme_rejected[str(phrase)[:40]] = float(ts or 0)
+        elif isinstance(rejected, list):  # 兼容存成列表的老格式
+            now = time.time()
+            for phrase in rejected:
+                self.meme_rejected[str(phrase)[:40]] = now
+        self.meme_last = float(raw.get("last") or 0)
+
+    def _save_memes(self) -> None:
+        try:
+            tmp = MEME_CACHE_FILE.with_suffix(".tmp")
+            tmp.write_text(
+                json.dumps(
+                    {
+                        "memes": self.memes,
+                        "rejected": self.meme_rejected,
+                        "last": self.meme_last,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            tmp.replace(MEME_CACHE_FILE)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("梗缓存写不进去:%s", exc)
+
+    @staticmethod
+    def _parse_memes(text: str) -> list[dict[str, Any]]:
+        """从搜索模型回的话里抠出那个 JSON 数组,容错点:带了废话、夹着别的方括号也能捞出来。"""
+        if not text:
+            return []
+        # 候选:先试「最大的一段」(从第一个 [ 到最后一个 ]);再试每一对方括号。
+        # 模型偶尔会在数组前面写「来源[1]」这种,只认第一个 [ 会连带把正文也塞进来解析失败。
+        spans = re.findall(r"\[.*\]", text, re.S) + re.findall(r"\[[^\[\]]*\]", text, re.S)
+        for span in spans:
+            try:
+                arr = json.loads(span)
+            except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(arr, list):
+                continue
+            out: list[dict[str, Any]] = []
+            for m in arr:
+                if not isinstance(m, dict):
+                    continue
+                phrase = str(m.get("phrase") or "").strip()
+                if phrase:
+                    out.append(
+                        {
+                            "phrase": phrase[:40],
+                            "origin": str(m.get("origin") or "").strip()[:80],
+                            "usage": str(m.get("usage") or "").strip()[:80],
+                        }
+                    )
+            if out:
+                return out
+        return []
+
+    def meme_note(self, limit: int | None = None) -> str:
+        """把攒下的梗摆成几行给聊天模型 —— 够不够用、用不用得上,让她自己判断。"""
+        if not self.memes:
+            return ""
+        if limit is None:
+            limit = int(self.cfg.get("meme_max", MEME_MAX))
+        lines: list[str] = []
+        for m in self.memes[-limit:]:
+            line = f"- {m['phrase']}"
+            if m.get("usage"):
+                line += f"(用法:{m['usage']})"
+            lines.append(line)
+        return "\n".join(lines)
+
+    async def _prefetch_memes(self) -> None:
+        """每隔一阵子上网搜一批最近流行的梗存着,说话时她自己挑着用。"""
+        if not self.cfg.get("meme_enabled", True):
+            return
+        now = time.time()
+        gap = float(self.cfg.get("meme_search_hours", 24)) * 3600
+        if now - self.meme_last < gap:
+            return
+        log.info("上网搜一搜最近流行的梗")
+        try:
+            raw = await self._search_once(
+                "最近网络热梗 流行语 评论区句式 近一个月",
+                MEME_ASK_SYS.format(date=datetime.now().strftime("%Y年%m月%d日")),
+                str(self.cfg.get("meme_search_model") or ""),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("搜梗失败:%s", exc)
+            return
+        # 不管这次搜到没搜到,都把时间戳往前推 —— 免得搜不到就一直重试烧钱
+        self.meme_last = now
+        got = self._parse_memes(raw)
+        if got:
+            seen = {m["phrase"] for m in self.memes}
+            for m in got:
+                # 被群友否过的梗就别再收了 —— 搜出来也不用
+                if m["phrase"] in seen or m["phrase"] in self.meme_rejected:
+                    continue
+                seen.add(m["phrase"])
+                m["first_seen"] = now
+                m["last_seen"] = now
+                self.memes.append(m)
+        self._prune_memes()
+        self._save_memes()
+
+    def _prune_memes(self) -> None:
+        """过期的梗删掉:跟「常聊话题」一个路子 —— 没人提就留不住。
+
+        判删看 `last_seen`(最近一次在群里出现的时间):超过 meme_forget_days 没人提就删,
+        新加的梗 last_seen = 加入时间,所以不会刚进来就被清掉。
+        拉黑名单也跟着过期:缓几个月那个梗又流行了,给它一次机会。
+        顺带压个总数上限,免得攒成一本字典。
+        """
+        cutoff = time.time() - float(self.cfg.get("meme_forget_days", MEME_FORGET_DAYS)) * 86400
+        self.memes = [
+            m
+            for m in self.memes
+            if float(m.get("last_seen") or m.get("first_seen") or 0) >= cutoff
+        ]
+        self.meme_rejected = {
+            p: float(ts) for p, ts in self.meme_rejected.items() if float(ts or 0) >= cutoff
+        }
+        cap = max(int(self.cfg.get("meme_max", MEME_MAX)) * 4, 32)
+        if len(self.memes) > cap:
+            self.memes = self.memes[-cap:]
+
+    def observe_memes(self, text: str) -> None:
+        """群消息里提到了某个攒着的梗,就给它续一笔命 —— 没人提的梗会过期被删。
+
+        跟「常聊话题」的衰减同一个路子:梗靠群里还在用它才活着。
+        """
+        if not self.memes or not text:
+            return
+        now = time.time()
+        hit = False
+        for m in self.memes:
+            phrase = m["phrase"]
+            if len(phrase) >= 2 and phrase in text:
+                m["last_seen"] = now
+                hit = True
+        if hit:
+            self._save_memes()
+
+    def note_meme_used(self, session_key: str, answer: str) -> None:
+        """她刚回的话里带没带攒着的梗?带了就盯着群里接下来几句的反应。
+
+        宁可漏判也别误判(误判要白花一次分析、还可能误杀好梗):先用整句 phrase 匹配,
+        再退化到取前 4 个字 —— 她被要求「用自己的话带出来」,整句未必原样出现。
+        """
+        if not self.cfg.get("meme_feedback_enabled", True) or not self.memes or not answer:
+            return
+        for m in self.memes:
+            phrase = m["phrase"]
+            if phrase in answer or (len(phrase) >= 5 and phrase[:4] in answer):
+                self.meme_watch[session_key] = {
+                    "phrase": phrase,
+                    "t": time.time(),
+                    "collected": [],
+                }
+                log.info("她用了梗「%s」,盯着群里反应", phrase)
+                return
+
+    def collect_meme_feedback(self, session_key: str, text: str) -> None:
+        """收群里接下来的反应;收够 meme_feedback_msgs 条就交给模型判断感不感冒。"""
+        w = self.meme_watch.get(session_key)
+        if not w or not text:
+            return
+        window = float(self.cfg.get("meme_feedback_minutes", 5)) * 60
+        if time.time() - float(w["t"]) > window:
+            self.meme_watch.pop(session_key, None)
+            return
+        w["collected"].append(text[:80])
+        need = int(self.cfg.get("meme_feedback_msgs", MEME_FEEDBACK_MSGS))
+        if len(w["collected"]) >= need:
+            self.meme_watch.pop(session_key, None)
+            # 别卡住群消息处理:分析扔进后台跑,fire-and-forget
+            asyncio.create_task(
+                self._judge_meme_reaction(w["phrase"], list(w["collected"]))
+            )
+
+    async def _judge_meme_reaction(self, phrase: str, lines: list[str]) -> None:
+        """让便宜模型读群里的反应:明显不感冒就把这梗拉黑,以后不再用。"""
+        chat = "\n".join(f"- {ln}" for ln in lines if ln.strip())
+        if not chat:
+            return
+        try:
+            verdict = await self.ask_plain(
+                MEME_FEEDBACK_ASK.format(phrase=phrase, chat=chat), max_tokens=8
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("判断梗反应失败:%s", exc)
+            return
+        if "不感冒" in verdict:
+            self._reject_meme(phrase)
+            log.info("群里对梗「%s」不感冒,拉黑,以后不用了", phrase)
+
+    def _reject_meme(self, phrase: str) -> None:
+        """把一个梗拉黑:从库里删掉、记进名单,搜到了也过滤,以后不再提。"""
+        self.meme_rejected[phrase] = time.time()
+        self.memes = [m for m in self.memes if m["phrase"] != phrase]
+        self._save_memes()
+
     # ---------- 域名白名单 ----------
 
     def is_safe_url(self, url: str) -> bool:
@@ -1005,16 +2222,6 @@ class Bot:
         )
 
     # ---------- OneBot 通信 ----------
-
-    async def call_api(self, action: str, params: dict[str, Any]) -> None:
-        """调用 OneBot 接口(不等待响应,失败只记日志)。"""
-        if self.ws is None:
-            return
-        payload = {"action": action, "params": params, "echo": action}
-        try:
-            await self.ws.send(json.dumps(payload, ensure_ascii=False))
-        except Exception as exc:  # noqa: BLE001
-            log.warning("调用 %s 失败: %s", action, exc)
 
     async def call_api_wait(
         self, action: str, params: dict[str, Any], timeout: float = 8
@@ -1047,16 +2254,39 @@ class Bot:
 
     async def send(self, event: dict[str, Any], message: Any) -> None:
         """发送消息。message 可以是纯文本,也可以是 OneBot 消息段列表。"""
+        # 出嘴边统一过一道「喵 + 颜文字」:所有回话都走这个口子,漏不掉
+        if isinstance(message, str):
+            message = decorate_speech(message)
+        elif isinstance(message, list):
+            message = [
+                (
+                    {**seg, "data": {**seg["data"], "text": decorate_speech(seg["data"]["text"])}}
+                    if seg.get("type") == "text"
+                    and isinstance(seg.get("data"), dict)
+                    and isinstance(seg["data"].get("text"), str)
+                    else seg
+                )
+                for seg in message
+            ]
         if event.get("message_type") == "group":
-            await self.call_api(
+            resp = await self.call_api_wait(
                 "send_group_msg",
                 {"group_id": event["group_id"], "message": message},
+                timeout=6,
             )
+            target = str(event.get("group_id") or "")
         else:
-            await self.call_api(
+            resp = await self.call_api_wait(
                 "send_private_msg",
                 {"user_id": event["user_id"], "message": message},
+                timeout=6,
             )
+            target = str(event.get("user_id") or "")
+        # 记下这条的 message_id:待会儿有人喊「撤回」时,才知道撤哪一条
+        data = resp.get("data") if isinstance(resp, dict) else None
+        mid = str((data or {}).get("message_id") or "") if isinstance(data, dict) else ""
+        if mid and target:
+            self.bot_msgs[target].append((time.time(), mid))
 
     async def reply(self, event: dict[str, Any], text: str) -> None:
         await self.send(event, text)
@@ -1068,6 +2298,33 @@ class Bot:
             self.last_bot_speak[session_key] = time.time()
             # 记下刚才是跟谁在聊:接话窗只接这个人的下文
             self.followup_partner[session_key] = str(event.get("user_id") or "")
+
+    async def empty_poke_reply(
+        self, event: dict[str, Any], session_key: str, speaker: str
+    ) -> None:
+        """被戳了一下(只 @ 了它 / 只叫了声名字 / 只甩了串标点)时的应声。
+
+        群里有人习惯连着戳两下叫你,每戳一次都回「怎么了？」「？」就成了复读机,
+        又吵又没用 —— 同一个人重复干同一件事,意思基本就是刚才那个,不必每次反问。
+        所以第一次应一句,同一个人 EMPTY_POKE_REPEAT_SECONDS 之内再来就先不吭声;
+        接话窗照样开着,他真要接着说事,该回还是回(那时走的是正常聊天那一路)。
+        """
+        who = str(event.get("user_id") or speaker or "")
+        key = f"{session_key}|{who}"
+        now = time.time()
+        last = self.poked_at.get(key, 0.0)
+        self.poked_at[key] = now
+        if last and now - last < EMPTY_POKE_REPEAT_SECONDS:
+            log.info("同一个人又戳了一下(%s),不跟着回「怎么了」了", speaker or who)
+            await self.open_chat_window(event, session_key)
+            return
+        lines = [
+            str(x)
+            for x in (self.cfg.get("empty_at_replies") or ["怎么了？"])
+            if str(x).strip()
+        ]
+        await self.reply(event, random.choice(lines) if lines else "怎么了？")
+        await self.open_chat_window(event, session_key)
 
     async def send_sticker(self, event: dict[str, Any], path: Path) -> None:
         """把本地表情包当图片发出去。"""
@@ -1136,6 +2393,8 @@ class Bot:
 
         # 群聊:@ 了它、或者叫了它的名字,这两种必须回,跟什么触发模式无关
         if at_bot or self.mentions_me(text):
+            # 被点名说明是正经找她,接话窗从头开
+            self.followup_streak[f"group_{event.get('group_id')}"] = 0
             return text if has_content else None
 
         mode = str(self.cfg.get("group_trigger", "smart")).lower()
@@ -1157,19 +2416,22 @@ class Bot:
         # 这句 @ 了别人(又不是在叫它)——那是在跟别人说话,一句都别插
         if self.parse_at_targets(event):
             return None
-        # 她刚跟某人说完话的一小会儿:那个人自己接着说的短句或追问,才算还在跟它聊;
-        # 别人插进来的话不算。而且这里不续期,免得一路接下去变成「群里每一条都回」
+        # 她刚跟某人说完话的一小会儿:那个人自己接着说、而且明显还在跟她聊,才算接话。
+        # 只认问句,或者话里带着「你 / 咋 / 怎么」这种指着她的词 —— 不然群里随口一句
+        # 短话(「没事」「完了」)都会被当成在跟她说话,就成了「群里每一条都回」。
+        # 再加一道闸:同一个会话连着接话最多 followup_max 次,接满了就闭嘴等下一次点名。
         follow = float(self.cfg.get("followup_seconds", 60))
         if follow > 0 and now - self.last_bot_speak.get(key, 0) <= follow:
             talking_to = self.followup_partner.get(key, "")
-            if talking_to and str(event.get("user_id") or "") == talking_to:
-                tail = self._strip_call(text)
-                if (
-                    not tail
-                    or tail.endswith(("?", "？"))
-                    or len(tail) <= int(self.cfg.get("followup_max_chars", 8))
-                ) and not self.in_quiet_hours():
-                    return text
+            if (
+                talking_to
+                and str(event.get("user_id") or "") == talking_to
+                and self.followup_streak.get(key, 0) < int(self.cfg.get("followup_max", 2))
+                and self._looks_at_me(self._strip_call(text))
+                and not self.in_quiet_hours()
+            ):
+                self.followup_streak[key] = self.followup_streak.get(key, 0) + 1
+                return text
         if now - self.last_chime.get(key, 0) < float(self.cfg.get("chime_cooldown", 300)):
             return None
         # 上次说完话一直没人接,就别再往上凑了
@@ -1180,8 +2442,38 @@ class Bot:
             return None
         if random.random() < float(self.cfg.get("chime_chance", 0.03)):
             self.last_chime[key] = now
+            self.followup_streak[key] = 0  # 自己插话是新的一轮,接话次数从头算
             return text
         return None
+
+    def _looks_at_me(self, tail: str) -> bool:
+        """这句像是接着跟她说的吗:问句,或者话里明显指着她(你 / 咋 / 怎么 / 帮 …)。
+        只按长度猜太松了,群里随便一句短话都会被她接走。"""
+        if not tail:
+            return True  # 只 @ 了一声、没说事,后面单独处理
+        if tail.endswith(("?", "？")):
+            return True
+        return bool(re.search(r"(你|您|咋|怎么|为啥|为什么|帮|看看|觉得|呢|吗)", tail))
+
+    def needs_fresh(self, text: str) -> bool:
+        """这句是不是时效性问题(比赛谁赢 / 最新版本 / 出了没这类)。
+
+        光在提示词里喊「时效性问题要先联网」不够 —— 快模型经常不开工具就凭记忆答,
+        所以代码替它认一遍:认出来就先替它搜,搜到的资料直接塞进上下文。
+
+        两道闸门,免得「每句话都去搜」:
+          ① 得命中时效关键词(FRESH_RE);
+          ② 还得是**在问事**的(问号 / 谁哪几多少 / 什么时候 / 吗呢…)。
+        不是问句的别搜 —— 「我进决赛了」「演唱会票价好贵」这种只是随口一说,搜了也没用,
+        白等十几秒还费钱。
+        """
+        t = self._strip_call(text)
+        return (
+            bool(t)
+            and len(t) <= 40
+            and bool(FRESH_RE.search(t))
+            and bool(ASK_RE.search(t))
+        )
 
     # ---------- DeepSeek ----------
 
@@ -1201,11 +2493,9 @@ class Bot:
                 )
                 resp.raise_for_status()
                 raw = resp.content
-                mime = resp.headers.get("content-type", "image/jpeg").split(";")[0]
             else:
                 path = ref[7:] if ref.startswith("file://") else ref
                 raw = Path(path).read_bytes()
-                mime = mimetypes.guess_type(path)[0] or "image/jpeg"
         except Exception as exc:  # noqa: BLE001
             # 下不动就直接放弃这张图。别把 http 链接原样丢给模型服务端:
             # 它那边同样抓不到,会返回 400 把整条回复一起吞掉。
@@ -1216,7 +2506,20 @@ class Bot:
         if len(raw) > limit:
             log.warning("图片超过 %dMB,已忽略", limit // 1024 // 1024)
             return None
-        return f"data:{mime};base64," + base64.b64encode(raw).decode()
+        return self.vision_data_url(raw)
+
+    def vision_data_url(self, raw: bytes) -> str:
+        """送去识图的 data URL:先压一道再拼。
+
+        原图动辄几 MB,直接 base64 传上去又慢又费 token;压完通常只剩几十 KB,
+        认出来的东西没差别。
+        """
+        small, mime = shrink_image_for_vision(
+            raw,
+            int(self.cfg.get("vision_max_edge", VISION_MAX_EDGE)),
+            int(self.cfg.get("vision_jpeg_quality", VISION_JPEG_QUALITY)),
+        )
+        return f"data:{mime};base64," + base64.b64encode(small).decode()
 
     def chat_endpoint(self) -> tuple[str, str, bool]:
         """文字聊天走哪个接口:配了 chat_api_key 就单独接一家(比如 DeepSeek 官网),
@@ -1235,11 +2538,17 @@ class Bot:
         use_search: bool = False,
         tools: bool = False,
         speaker: str = "",
+        quote: str = "",
+        web_note: str = "",
+        topic_note: str = "",
     ) -> str:
         history = self.history[session_key]
         images = images or []
         # 群里好几个人说话,不标名字模型分不清谁说的,上下文就废了一半
         text = f"{speaker}: {user_text}".strip() if speaker else user_text
+        # 他引用了哪条,就把那条一起摆出来,不然「你怎么这么说」她根本不知道指的是什么
+        if quote:
+            text = f"(引用 {quote}) {text}"
 
         # 本轮消息:带图就拼成多模态内容
         current: Any = text
@@ -1267,22 +2576,48 @@ class Bot:
         # 挂工具时补一句「你会什么」;带图 / 联网那条路不挂工具,就别说
         if tools and not images and not use_search:
             system_prompt += NATURAL_HINT
-            # 顺手把今天的日期塞进去:模型不知道「现在」是几号,就分不清哪些事该联网
+        # 「今天是几号」这条哪条路都得给:模型不知道现在是什么时候,
+        # 就会把过期的事当现状答(世界杯早结束了还在讲谁踢谁)。
+        if not images:
             system_prompt += TODAY_TPL.format(
                 date=datetime.now().strftime("%Y年%m月%d日")
             )
         if use_search and not images:
             system_prompt += SEARCH_HINT
+        # 时效性问题由代码先搜过一遍,资料直接摆在这儿,别让她凭记忆答
+        if web_note and not images:
+            system_prompt += WEB_NOTE_TPL.format(note=web_note)
+        # 提前替群里搜好的常聊话题资料:这一轮没走当场搜,就把话题背景带上,
+        # 让她知道群里爱聊什么、也已经有过现成资料(聊到时不必再搜)
+        if topic_note and not images and not web_note:
+            system_prompt += TOPIC_BRIEF_TPL.format(items=topic_note)
+        # 最近网上的梗:随身带着,聊到对得上的话头她就能顺口来一句。
+        # 正在给正经结论(web_note)时不掺,免得把梗硬塞进答案里。
+        meme_note = self.meme_note()
+        if meme_note and not web_note:
+            system_prompt += MEME_TPL.format(items=meme_note)
         if self.stickers and not images:
             system_prompt += STICKER_HINT.format(items=self.sticker_list_text())
         if self.ambient.get(session_key):
             system_prompt += AMBIENT_TPL.format(chat="\n".join(self.ambient[session_key]))
-        # 以前的聊天里有没有相关的,捞出来提一句(轻量长期记忆)
+        # 以前的聊天里有没有相关的,捞出来提一句(轻量长期记忆)。
+        # 短期历史还在时,近 10 分钟的话本来就在上下文里,不必再捞一遍占位置;
+        # 但历史是空的(刚重启 / 刚 /重置),说明真的断片了,这时候连最新的也得捞。
         recalled = self.memory.search(
-            session_key, user_text, int(self.cfg.get("memory_recall", 4))
+            session_key,
+            user_text,
+            int(self.cfg.get("memory_recall", 4)),
+            skip_recent=600 if history else 0,
         )
         if recalled:
             system_prompt += MEMORY_TPL.format(items="\n".join(recalled))
+        # 她自己最近说过的话单独摆一份:光靠短期上下文不稳,聊几句就被刷掉、
+        # 重启一次全没,别人追问「你刚不是说…」她翻不到就只能死不认账。
+        said = self.memory.recent_said(
+            session_key, self.bot_names()[0], int(self.cfg.get("self_said_recall", 5))
+        )
+        if said:
+            system_prompt += SAID_TPL.format(items="\n".join(f"- {s}" for s in said))
         # 早上好 / 晚安 / 生日快乐 这类,给一句方向就行,话由她自己说
         rule = self.reaction.pop(session_key, "")
         if rule:
@@ -1325,7 +2660,7 @@ class Bot:
         # 带图、联网这两条路不挂工具:一条走视觉模型、一条本来就在搜
         attach_tools = tools and not images and not use_search
         if attach_tools:
-            payload["tools"] = TOOLS
+            payload["tools"] = TOOLS_NO_SEARCH if web_note else TOOLS
         if on_official:
             # 官网的思考模式默认就是开的,群里聊天要快,明确关掉;
             # 它也不认百炼那套 enable_thinking / enable_search,所以只发它认的参数
@@ -1434,37 +2769,50 @@ class Bot:
                 return await self.fetch_hot()
             if name == "group_stats":
                 return self.stats_text(session_key)
+            if name == "group_topic":
+                return self.topic_report(session_key) or "群里最近还没聊出什么固定话题"
             if name == "web_search":
                 query = str((args or {}).get("query") or "").strip()
                 if not query:
                     return "没给要查的内容"
-                return await self.tool_web_search(query)
+                return await self.tool_web_search(query, session_key)
         except Exception as exc:  # noqa: BLE001
             log.warning("工具 %s 执行失败:%s", name, exc)
             return f"这个我这边没跑成({name})"
         log.warning("模型要调不存在的工具:%s", name)
         return f"没有 {name} 这么个东西"
 
-    async def tool_web_search(self, query: str) -> str:
-        """给模型当工具用的联网搜索。走百炼那边的搜索模型(官网搜不了)。"""
+    async def _search_once(self, query: str, sys_prompt: str, model: str = "") -> str:
+        """跑一趟联网搜索,返回搜索模型给的原文。出错就返回「没搜到…」那句话。
+
+        model 留空就用配置里的主力搜索模型(要准);传了就用传进来的 ——
+        话题预热这种后台活儿用便宜档就行,别拿 Max 去搜。
+        """
         url = self.cfg.get("deepseek_base_url", "").rstrip("/") + "/chat/completions"
-        model = str(self.cfg.get("search_model") or self.cfg.get("model", ""))
+        model = model or str(self.cfg.get("search_model") or self.cfg.get("model", ""))
         payload: dict[str, Any] = {
             "model": model,
-            "messages": [{"role": "user", "content": query}],
+            "messages": [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": query},
+            ],
             "stream": False,
-            "max_tokens": int(self.cfg.get("max_tokens", 400)),
+            # 搜索答案不用写长:输出越长等得越久。给短一点,一句话结论 + 两条来源就够。
+            "max_tokens": int(
+                self.cfg.get("search_max_tokens") or self.cfg.get("max_tokens", 400)
+            ),
             "enable_search": True,
         }
-        # 百炼的 DeepSeek 不关思考会烧成空白正文,老坑
-        if is_deepseek(model):
+        # 百炼的 DeepSeek 不关思考会烧成空白正文,老坑。
+        # qwen3 系列的搜索模型同理:搜索答案要短,思考开着容易把 max_tokens 烧光。
+        if is_deepseek(model) or str(model).strip().lower().startswith("qwen3"):
             payload["enable_thinking"] = False
         headers = {
             "Authorization": f"Bearer {self.cfg['deepseek_api_key']}",
             "Content-Type": "application/json",
         }
         try:
-            resp = await self.http.post(url, json=payload, headers=headers, timeout=60)
+            resp = await self.http.post(url, json=payload, headers=headers, timeout=30)
             if resp.status_code != 200:
                 return f"没搜到(接口 {resp.status_code})"
             text = (resp.json()["choices"][0]["message"].get("content") or "").strip()
@@ -1472,6 +2820,45 @@ class Bot:
         except Exception as exc:  # noqa: BLE001
             log.warning("工具联网搜索失败:%s", exc)
             return f"搜索没连上({exc})"
+
+    async def tool_web_search(
+        self, query: str, session_key: str = "", model: str = ""
+    ) -> str:
+        """给模型当工具用的联网搜索。
+
+        model 留空走主力搜索模型;话题预热那类后台活儿传个便宜档进来。
+
+        四件事:
+          ① 同一个问题问第二遍直接拿缓存,不再联网;
+          ② 把群里最近聊的话题塞进搜索要求,免得问题里的名字被按字面理解成别的领域的人;
+          ③ 搜到的答案短(搜索答案越长等得越久),只要一句话结论 + 两条带日期的来源;
+          ④ 那两条来源要是**说法一致**就够了,一次收工;不一致(或者只搜到一条)
+             再补搜一遍 —— 绝大多数情况都停在第一趟,不会白等第二次。
+        """
+        fresh = bool(FRESH_RE.search(query))
+        cached = self.web_cache.get(query)
+        if cached:
+            log.info("这个问题搜过,直接用缓存:%s", query[:30])
+            return cached
+        ask = SEARCH_ASK_SYS.format(date=datetime.now().strftime("%Y年%m月%d日"))
+        # 群里刚在聊什么,给搜索定个语境。没有这条,「ZMJJKK 和 LUKXO」会被当成两个运动员
+        topic = self.recent_topic(session_key)
+        if topic:
+            ask += SEARCH_TOPIC_TPL.format(topic=topic)
+            log.info("带上群里的话题去搜:%s | %s", topic[:40], query[:30])
+        started = time.perf_counter()
+        text = await self._search_once(query, ask, model)
+        log.info("搜索耗时 %.1fs:%s", time.perf_counter() - started, query[:30])
+        if not text or text.startswith(("没搜到", "搜索没连上")):
+            return text or "没搜到相关的东西"
+        # 来源打架、或者只有一个来源,才再搜一趟(最多补一次,别转圈)
+        if CONFLICT_RE.search(text):
+            log.info("来源说法不一致,再补搜一趟核对:%s", query[:30])
+            again = await self._search_once(query, SEARCH_ASK_SYS_B, model)
+            if again and not again.startswith(("没搜到", "搜索没连上")):
+                text = f"{text}\n---\n另找的一批资料:\n{again}"
+        self.web_cache.put(query, text, fresh)
+        return text
 
     async def ask_plain(self, prompt: str, max_tokens: int = 80) -> str:
         """问模型一句话,不进对话历史(小游戏判定这种用完就丢的场合用)。"""
@@ -1635,6 +3022,11 @@ class Bot:
         log.info(
             "生图耗时 %.1fs(参考图:%s)", time.perf_counter() - started, "有" if ref_raw else "无"
         )
+        # 记下这张图的指纹:她生出来的是「画」,不是表情包,别让偷图逻辑收进库
+        try:
+            self._remember_gen_image(base64.b64decode(b64))
+        except Exception:  # noqa: BLE001
+            pass
         await self.send(event, [{"type": "image", "data": {"file": f"base64://{b64}"}}])
 
     # ---------- 图片搜索 ----------
@@ -1750,19 +3142,25 @@ class Bot:
         log.info("图片搜索「%s」命中 %d 张", query[:30], len(images))
         return images
 
-    async def ask_vision(self, text: str, data_url: str, max_tokens: int = 200) -> str:
-        """拿一张图问识图模型一句话。max_tokens 大一点能让它看得更仔细。"""
+    async def ask_vision(
+        self, text: str, raw: bytes, max_tokens: int = 200, model: str = ""
+    ) -> str:
+        """拿一张图问识图模型一句话。max_tokens 大一点能让它看得更仔细。
+
+        传进来的是原图字节,这里先压小再发 —— 上传体积小一截,等待和花费都跟着降。
+        model 给了就用它,不然用 vision_model:偷表情包单独配了更强的识图模型,只走这一条路。
+        """
         c = self.cfg
         resp = await self.http.post(
             c.get("deepseek_base_url", "").rstrip("/") + "/chat/completions",
             json={
-                "model": c.get("vision_model"),
+                "model": model or c.get("vision_model"),
                 "messages": [
                     {
                         "role": "user",
                         "content": [
                             {"type": "text", "text": text},
-                            {"type": "image_url", "image_url": {"url": data_url}},
+                            {"type": "image_url", "image_url": {"url": self.vision_data_url(raw)}},
                         ],
                     }
                 ],
@@ -1773,7 +3171,7 @@ class Bot:
                 "Authorization": f"Bearer {c['deepseek_api_key']}",
                 "Content-Type": "application/json",
             },
-            timeout=120,
+            timeout=60,
         )
         resp.raise_for_status()
         return strip_self_prefix(
@@ -1803,7 +3201,7 @@ class Bot:
                 desc = await self.ask_vision(
                     "只回答一句话:图里的卡通角色或人物叫什么名字?它是什么颜色、什么样?"
                     "如果不是角色,说明这是什么。",
-                    bytes_to_data_url(raw),
+                    raw,
                 )
             except Exception as exc:  # noqa: BLE001
                 log.warning("参考图识别失败: %s", exc)
@@ -1882,6 +3280,12 @@ class Bot:
             )
             # 统计、日报素材、冷场计时、长期记忆都记在这一笔里
             self.track_group(session_key, speaker, text)
+            # 「用户爱聊什么」:反复出现的词攒起来,回头替他们提前搜好
+            self.observe_topic(session_key, str(event.get("user_id") or ""), text)
+            # 群里在说到某个攒着的梗就给它续命(没人提的梗会过期被删),
+            # 顺便收一下她对上次那个梗的反应
+            self.observe_memes(text)
+            self.collect_meme_feedback(session_key, text)
 
         # 命令不用 @ 机器人也能用;成语接龙进行中,直接发四个字也算接龙
         playing_idiom = self.games.get(session_key, {}).get("kind") == "idiom"
@@ -1893,27 +3297,16 @@ class Bot:
         else:
             ask_text = self.should_reply(event, text, at_bot, bool(images))
 
-        # 群里只是叫一声「小鲸鱼」、没说事:直接应一声,别让模型去接群里之前的话题
+        # 群里只是叫一声「小鲸鱼」、没说事:直接应一声,别让模型去接群里之前的话题。
+        # 同一个人反复叫 / 反复甩「？？？」就不跟着复读了(见 empty_poke_reply)
         if is_group and ask_text is not None and not self._strip_call(ask_text):
-            lines = [
-                str(x)
-                for x in (self.cfg.get("empty_at_replies") or ["怎么了？"])
-                if str(x).strip()
-            ]
-            await self.reply(event, random.choice(lines) if lines else "怎么了？")
-            await self.open_chat_window(event, session_key)
+            await self.empty_poke_reply(event, session_key, speaker)
             return
 
         if ask_text is None:
-            # 只 @ 了一下、什么都没说:别装没看见,随口应一声
+            # 只 @ 了一下、什么都没说:别装没看见,随口应一声(反复戳就不应了)
             if is_group and at_bot and not text.strip() and not images:
-                lines = [
-                    str(x)
-                    for x in (self.cfg.get("empty_at_replies") or ["怎么了？"])
-                    if str(x).strip()
-                ]
-                await self.reply(event, random.choice(lines) if lines else "怎么了？")
-                await self.open_chat_window(event, session_key)
+                await self.empty_poke_reply(event, session_key, speaker)
                 return
             # 没点它的话也听着,顺带该复读就复读
             self.remember_ambient(session_key, speaker, text, bool(images))
@@ -1999,10 +3392,43 @@ class Bot:
                 await self.send_generated_image(event, ask_text)
                 return
 
+            # 「群里最近在聊什么 / 有什么热点话题」——代码直接报常聊话题,
+            # 不等模型自己想起来调 group_topic(快模型经常想不起来,又要多等一轮)
+            if not use_search and TOPIC_Q_RE.search(ask_text):
+                topic_ans = self.topic_report(session_key)
+                if topic_ans:
+                    log.info("问群里的热点话题,直接报常聊话题")
+                    await self.reply(event, topic_ans)
+                    return
+
             if use_search:
                 await self.reply(
                     event, self.cfg.get("search_hint", "正在联网搜索,请稍等…")
                 )
+            # 时效性问题(谁赢了 / 最新 / 出了没)不等模型自己想起来联网,这里先搜一遍。
+            # 搜到的原文当资料塞进上下文,再由她用自己口气讲,免得拿旧记忆下结论。
+            # 这一趟搜索和「取引用那条消息」互不依赖,并着跑,少等一次往返。
+            # 而且同一个问题搜过就直接用缓存,压根不再联网。
+            # 提前替群里搜好的常聊话题资料,当背景带着(有就带,没有就算了)
+            topic_note = self.topic_background(session_key)
+            web_note = ""
+            if not use_search and self.needs_fresh(ask_text):
+                # 正好问到常聊话题、又有提前搜好的资料 → 直接用,不再当场联网干等
+                hot_topic, brief = self.prefetched_note(session_key, ask_text)
+                if brief:
+                    log.info("聊到常聊话题「%s」,用提前搜好的资料,免搜", hot_topic)
+                    web_note, quote = brief, await self.quoted_snippet(event)
+                else:
+                    log.info("时效性问题,先替她搜一遍:%s", ask_text[:40])
+                    web_note, quote = await asyncio.gather(
+                        self.tool_web_search(ask_text, session_key),
+                        self.quoted_snippet(event),
+                    )
+            else:
+                # 他引用了哪条消息,就把那条也取出来一起看
+                quote = await self.quoted_snippet(event)
+            if quote:
+                log.info("引用:%s", quote[:60])
             started = time.perf_counter()
             failed = False
             try:
@@ -2013,6 +3439,9 @@ class Bot:
                     use_search=use_search,
                     tools=not use_search,
                     speaker=speaker,
+                    quote=quote,
+                    web_note=web_note,
+                    topic_note=topic_note,
                 )
             except Exception:  # noqa: BLE001
                 log.exception("生成回复出错")
@@ -2029,8 +3458,20 @@ class Bot:
                     self.remember_sticker(session_key, sticker.name)
                 return
 
-            # 没打 /画,但模型自己判断出用户是在要图(自然语言)
             guess, want_draw = split_draw_marker(answer)
+            remark, find_kw = split_find_marker(answer)
+            # 用户嘴上说的是「发张表情包」,模型却吐了 [DRAW]/[FIND]:
+            # 他要的是本地库里现成的一张,不是现画、也不是上网找。改走库,别去生图。
+            if (want_draw or find_kw) and wants_local_sticker(ask_text) and self.stickers:
+                sticker = self.pick_sticker(self._strip_call(ask_text) or ask_text, session_key)
+                if sticker:
+                    log.info("要表情包,从库里发:%s(模型本来给了要图的标记)", sticker.name)
+                    await self.send_sticker(event, sticker)
+                    self.remember_sticker(session_key, sticker.name)
+                    await self.open_chat_window(event, session_key)
+                    return
+
+            # 没打 /画,但模型自己判断出用户是在要图(自然语言)
             if want_draw:
                 log.info("模型判定要画图:%s", guess[:60])
                 # 拿用户原话去联网查准,模型的理解只当参考(它可能压根不认识那角色)
@@ -2038,7 +3479,6 @@ class Bot:
                 return
 
             # 用户要的是现成的图,那就直接上网找,别费劲去画
-            remark, find_kw = split_find_marker(answer)
             if find_kw:
                 log.info("模型判定要找图:%s", find_kw[:60])
                 if remark:
@@ -2072,6 +3512,11 @@ class Bot:
                 # 长回复拆成几条发,第一条引用对方,看着更像真人
                 await self.send_answer(event, answer)
                 await self.open_chat_window(event, session_key)
+                # 自己说过的话也留一份。以前只存别人说的,她转头就不认账:
+                # 「你刚不是说 XX 吗」→「我没说过」。存下来她才能捞回自己的原话。
+                self.memory.add(session_key, self.bot_names()[0], answer)
+                # 这句里要是用了攒着的梗,就盯着群里接下来的反应(不感冒就拉黑)
+                self.note_meme_used(session_key, answer)
             if sticker:
                 await self.send_sticker(event, sticker)
                 self.remember_sticker(session_key, sticker.name)
@@ -2147,6 +3592,77 @@ class Bot:
             if qq and qq != self.self_id:
                 return qq
         return ""
+
+    async def quoted_snippet(self, event: dict[str, Any]) -> str:
+        """这条消息引用了哪条?把被引用那条的「谁: 说了啥」取回来。
+
+        以前只有踢人时才会去翻被引用的消息,聊天时引用内容一律看不见 ——
+        别人「引用她某句话再怼一句」,她看不到那句话,自然答得驴唇不对马嘴。
+        """
+        for seg in event.get("message") or []:
+            if not isinstance(seg, dict) or seg.get("type") != "reply":
+                continue
+            mid = str((seg.get("data") or {}).get("id") or "")
+            if not mid:
+                continue
+            resp = await self.call_api_wait("get_msg", {"message_id": mid})
+            data = resp.get("data") if isinstance(resp, dict) else None
+            if not isinstance(data, dict):
+                continue
+            sender = data.get("sender") or {}
+            who = str(sender.get("card") or sender.get("nickname") or "").strip()
+            if who == "" or str(sender.get("user_id") or "") == self.self_id:
+                who = self.bot_names()[0]  # 引用的是她自己说的话
+            raw = data.get("message")
+            if isinstance(raw, list):
+                texts = [
+                    str((s.get("data") or {}).get("text") or "")
+                    for s in raw
+                    if isinstance(s, dict) and s.get("type") == "text"
+                ]
+                body = "".join(texts).strip()
+                if not body and any(
+                    isinstance(s, dict) and s.get("type") == "image" for s in raw
+                ):
+                    body = "[图片]"
+            else:
+                body = str(data.get("raw_message") or "").strip()
+            if not body:
+                body = "[非文字消息]"
+            return f"{who}: {body[:200]}"
+        return ""
+
+    async def do_recall(self, event: dict[str, Any]) -> str:
+        """撤回。群里谁都能喊一声,但她真正撤得掉的只有自己发出去的东西。
+
+        ① 他引用了某条消息再喊「撤回」→ 撤被引用的那条(这就是「撤回他引用的那条」);
+        ② 没引用 → 撤她在这个会话里最近发的那一条。
+        撤不掉(不是她发的、她不是群管理、或者过了能撤的时间)就如实说,别假装撤成功了。
+        """
+        for seg in event.get("message") or []:
+            if isinstance(seg, dict) and seg.get("type") == "reply":
+                mid = str((seg.get("data") or {}).get("id") or "")
+                if mid:
+                    return await self._delete_msg(mid, "他引用的那条")
+        target = str(event.get("group_id") or event.get("user_id") or "")
+        buf = self.bot_msgs.get(target)
+        while buf:
+            _, mid = buf.pop()
+            if mid:
+                return await self._delete_msg(mid, "我刚说的")
+        return "最近没找到能撤的喵"
+
+    async def _delete_msg(self, message_id: str, what: str) -> str:
+        """撤一条消息,成功失败都如实反馈。"""
+        resp = await self.call_api_wait("delete_msg", {"message_id": message_id})
+        ok = isinstance(resp, dict) and (
+            str(resp.get("status") or "").lower() == "ok" or resp.get("retcode") == 0
+        )
+        if ok:
+            log.info("撤回%s:%s", what, message_id)
+            return f"撤了{what}喵"
+        log.info("没撤掉%s(%s):%s", what, message_id, resp)
+        return "这条我撤不了喵(不是我发的,或者已经过了能撤的时候)"
 
     async def guess_kick_target(self, event: dict[str, Any], text: str) -> tuple[str, str]:
         """口语里要踢谁:① @ 的 ② 引用的是谁 ③ 说「我」就是他自己 ④ 名字对得上。
@@ -2443,56 +3959,6 @@ class Bot:
         ]
         return "百度实时热搜:\n" + "\n".join(lines)
 
-    # --- 额度:查阿里云百炼的免费额度 ---
-
-    def balance_models(self) -> list[str]:
-        """报额度时报哪几个模型,就是机器人自己在用的那几个。"""
-        _, _, on_official = self.chat_endpoint()
-        keys = ["vision_model", "search_model", "image_model", "draw_prompt_model"]
-        if not on_official:  # 文字聊天已经接去别家了,就别在阿里云这边找它
-            keys.insert(0, "model")
-        out: list[str] = []
-        for key in keys:
-            name = str(self.cfg.get(key) or "").strip()
-            if name and name not in out:
-                out.append(name)
-        return out
-
-    @staticmethod
-    def short_num(value: Any) -> str:
-        """610488 写成 61.0万,省得刷屏。"""
-        try:
-            num = float(value)
-        except (TypeError, ValueError):
-            return "?"
-        return f"{num / 10000:.1f}万" if num >= 10000 else f"{num:.0f}"
-
-    def balance_text(self, rows: list[dict[str, Any]]) -> str:
-        """把 bl usage free 的结果写成一小段人话。"""
-        by_model = {str(r.get("model")): r for r in rows if isinstance(r, dict)}
-        lines, used = [], []
-        for name in self.balance_models():
-            row = by_model.get(name)
-            if not row:
-                lines.append(f"· {name}: 没查到(这个模型不送免费额度,或者已经用完)")
-                continue
-            used.append(row)
-            pct = row.get("remainingPercent")
-            pct = f"{float(pct):.0f}%" if pct is not None else "?"
-            lines.append(
-                f"· {name}: 剩 {self.short_num(row.get('remaining'))}"
-                f" / {self.short_num(row.get('total'))}({pct})"
-            )
-        expires = [str(r.get("expires")) for r in used if r.get("expires")]
-        tail = f"\n最早到期:{min(expires)}" if expires else ""
-        _, _, on_official = self.chat_endpoint()
-        title = (
-            "【阿里云百炼 · 识图 / 搜索 / 生图】"
-            if on_official
-            else "鲸鲸的白饭还剩这些(阿里云免费额度):"
-        )
-        return title + "\n" + "\n".join(lines) + tail
-
     async def fetch_ds_balance(self) -> str:
         """问 DeepSeek 官网还剩多少钱。"""
         base, key, on_official = self.chat_endpoint()
@@ -2531,44 +3997,6 @@ class Bot:
         if data.get("is_available") is False:
             segs.append("余额见底了,可能已经扣不动")
         return head + "\n· 余额 " + " ".join(segs)
-
-    async def fetch_aliyun_balance(self) -> str:
-        """跑一次 bl usage free,问阿里云还剩多少额度。
-
-        /余额 现在不展示这一块了(只报官网余额 + 阿里云现金/券),这个留着备用。
-        """
-        exe = find_bl()
-        if not exe:
-            return "【阿里云百炼】\n没找到命令行工具(bl),装上才能查额度"
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                exe,
-                "usage",
-                "free",
-                "--output",
-                "json",
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=25)
-        except asyncio.TimeoutError:
-            return "【阿里云百炼】\n查额度超时了,过会儿再喊我"
-        except Exception as exc:  # noqa: BLE001
-            return f"【阿里云百炼】\n查额度失败了({exc})"
-        text = out.decode("utf-8-sig", "replace").strip()
-        try:
-            rows = json.loads(text)
-        except ValueError:
-            return (
-                "【阿里云百炼】\n查额度没成功,可能要重新登录一次"
-                f"(bl auth login --console)\n{text[:80]}"
-            )
-        if isinstance(rows, dict):
-            msg = str((rows.get("error") or {}).get("message") or text[:80])
-            return f"【阿里云百炼】\n查额度没成功:{msg}\n重新登录一次就好了"
-        if not isinstance(rows, list) or not rows:
-            return "【阿里云百炼】\n没查到免费额度"
-        return self.balance_text(rows)
 
     async def _bss_call(
         self, action: str, version: str, extra: dict[str, str] | None = None
@@ -2876,6 +4304,8 @@ class Bot:
             await self.reply(event, self.stats_text(session_key))
         elif head == "余额":
             await self.reply(event, await self.fetch_balance())
+        elif head in ("撤回", "撤销"):
+            await self.reply(event, await self.do_recall(event))
         elif head in ("禁言", "解除禁言", "全体禁言", "踢", "踢人"):
             await self.reply(event, await self.do_admin(event, head, rest, is_group))
         return True
@@ -3093,6 +4523,8 @@ class Bot:
                 await self.maybe_daily_report()
                 await self.maybe_speak()
                 self.memory.save()
+                self.web_cache.save()
+                self.vision_cache.save()
             except Exception:  # noqa: BLE001
                 log.exception("主动消息/日报出错")
 
@@ -3109,7 +4541,10 @@ class Bot:
         today = datetime.now().strftime("%Y-%m-%d")
         if self.steal_count.get("day") != today:
             self.steal_count = {"day": today, "n": 0}
+        if self.steal_vision.get("day") != today:
+            self.steal_vision = {"day": today, "n": 0}
         limit = int(self.cfg.get("steal_max_per_day", 8))
+        vision_limit = int(self.cfg.get("steal_vision_per_day", 50))
         min_conf = float(self.cfg.get("steal_min_confidence", 0.6))
         for ref in images[:2]:
             if self.steal_count["n"] >= limit:
@@ -3118,22 +4553,39 @@ class Bot:
             if not raw or len(raw) < 5000:  # 太小的多半是缩略图
                 continue
             digest = hashlib.md5(raw).hexdigest()
-            if digest in self.known_hashes:
+            # 库里已有的、以及她自己生图画出来的,都不收 —— 表情包只能是从群里别人那儿来的
+            if digest in self.known_hashes or digest in self.gen_hashes:
                 continue
-            # 见过一次不算数:截图/照片/商品图基本只出现一次,
-            # 真表情包会被不同的人反复发,攒够次数再收,顺便省一次识图钱
+            # 见过一次就算数(steal_min_seen 想调回「见过几次才收」就把它调大)。
+            # 以前默认 2,结果群里一口气发一堆新图时每张都只出现一次,一张都收不到
             seen = self.seen_counts.get(digest, 0) + 1
             self.seen_counts[digest] = seen
-            if seen < int(self.cfg.get("steal_min_seen", 2)):
+            if seen < int(self.cfg.get("steal_min_seen", 1)):
                 log.info("这张图第 %d 次见,还不够格,先不收", seen)
                 continue
             kind = str(
                 mimetypes.guess_type(ref.split("?")[0])[0] or "image/jpeg"
             ).lower()
             ext = IMAGE_EXT.get(kind, ".jpg")
-            data_url = f"data:{kind};base64,{base64.b64encode(raw).decode()}"
-            # token 给足,让它把「是不是表情包、什么时候用」看仔细(准确性优先)
-            verdict = await self.ask_vision(STEAL_PROMPT, data_url, max_tokens=320)
+            # 这张图识过就不用再看一遍:照片/截图这类永远收不进库,以前每被发一次都要重新识,
+            # 又慢又费;命中缓存直接拿上次的结论(原图照样原样存库,压的只是送去识图那份)
+            verdict = self.vision_cache.get(digest)
+            if verdict:
+                log.info("这张图识过了,直接用上次的结论,不再重复识图")
+            else:
+                # 识图要花钱,每天给个天花板:到点了就先不收新图,别把一年的额度烧光。
+                # 缓存命中的不算,所以反复发的图基本不占额度
+                if self.steal_vision["n"] >= vision_limit:
+                    log.info("今天偷图的识图次数已经用满了(%d 次),新的图先不收", vision_limit)
+                    return
+                # token 给足,让它把「是不是表情包、什么时候用」看仔细(准确性优先)。
+                # 偷表情包可以单独配一个更强的识图模型(steal_vision_model),和普通看图分开
+                self.steal_vision["n"] += 1
+                verdict = await self.ask_vision(
+                    STEAL_PROMPT, raw, max_tokens=320,
+                    model=str(self.cfg.get("steal_vision_model") or ""),
+                )
+                self.vision_cache.put(digest, verdict)
             start, end = verdict.find("{"), verdict.rfind("}")
             try:
                 info = json.loads(verdict[start : end + 1])
@@ -3151,7 +4603,8 @@ class Bot:
                 continue
             emotion = str(info.get("emotion") or "无语")[:8]
             scene = str(info.get("scene") or "")[:40]
-            taken = self._scene_taken(emotion, scene)
+            tags = [str(t)[:8] for t in (info.get("tags") or [])][:5]
+            taken = self._scene_taken(emotion, scene, tags)
             if taken:  # 同一种情况已经有一张了,留旧的就行
                 log.info("「%s」这种表情包库里有了(%s),这张就不留了", emotion, taken)
                 continue
@@ -3164,7 +4617,7 @@ class Bot:
                     "file": name,
                     "emotion": emotion,
                     "scene": scene,
-                    "tags": [str(t)[:8] for t in (info.get("tags") or [])][:5],
+                    "tags": tags,
                 }
                 self._append_sticker_index(item)
             except Exception as exc:  # noqa: BLE001
@@ -3175,13 +4628,30 @@ class Bot:
             self.steal_count["n"] += 1
             log.info("偷到一张表情包:%s(%s)", name, emotion)
 
-    def _scene_taken(self, emotion: str, scene: str) -> str:
+    def _scene_taken(self, emotion: str, scene: str, tags: list[str] | None = None) -> str:
         """库里有没有「同一种情况」的表情包了?有就返回那张的文件名,同种情况只留一张。
 
-        以情绪为主线比对(情绪一样,基本就是同一个使用场合),
-        情绪词互相包含也算同一类,比如「得意」和「得意忘形」;场景高度重合也算。
+        三样一起比,撞上一样就算重合:
+        - 情绪:一样、或者互相包含(「得意」和「得意忘形」算同一类);
+        - 场景:互相包含;
+        - 标签:按重合比例算 —— 新图和旧图谁的标签少,就以谁为分母,
+          重合到这个比例(≥ `sticker_tag_similar`,默认 0.6)就算重合。
+          不用交并比:两张图标签数常常不一样(识图模型每张给 3~5 个),
+          交并比会被标签多的那张把分母撑大 —— 新图 4 个标签里撞了 3 个,交并比才 0.5,
+          明明「撞了一大半」却判成不重合,该省的没省下来。
+          表情包本来就带好几个标签,两张图标签撞到这个程度,基本就是同一个使用场合,
+          收进来只是白占地方(用户要的就是「省空间,但每个情况都有一张能用的」)。
+        阈值调高就不容易判重、库里留得多;调低就删得狠、更省地方。
         """
         e, s = tag_key(emotion), tag_key(scene)
+        # 角色名(奶龙/二次元)是固定值,不是「使用场合」,剔掉再比 ——
+        # 不剔的话库里清一色同一只角色的图,谁跟谁都像同款,会误判成重合。
+        new_tags = {
+            tag_key(t)
+            for t in (tags or [])
+            if tag_key(t) and t not in STICKER_CHAR_TAGS
+        }
+        need = float(self.cfg.get("sticker_tag_similar", STICKER_TAG_SIMILAR))
         for item in self.stickers:
             old_e = tag_key(item.get("emotion") or "")
             old_s = tag_key(item.get("scene") or "")
@@ -3189,6 +4659,16 @@ class Bot:
                 return str(item.get("file") or "")
             if s and old_s and (s == old_s or s in old_s or old_s in s):
                 return str(item.get("file") or "")
+            if len(new_tags) >= 2:
+                old_tags = {
+                    tag_key(t)
+                    for t in (item.get("tags") or [])
+                    if tag_key(t) and t not in STICKER_CHAR_TAGS
+                }
+                if len(old_tags) >= 2:
+                    shared = len(new_tags & old_tags)
+                    if shared / min(len(new_tags), len(old_tags)) >= need:
+                        return str(item.get("file") or "")
         return ""
 
     def _append_sticker_index(self, item: dict[str, Any]) -> None:
@@ -3258,6 +4738,7 @@ class Bot:
         asyncio.create_task(self.watch_stale())
         asyncio.create_task(self.reminder_loop())
         asyncio.create_task(self.proactive_loop())
+        asyncio.create_task(self.topic_loop())
         tries = 0
         while True:
             try:

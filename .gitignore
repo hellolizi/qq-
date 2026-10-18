@@ -15,6 +15,11 @@ __pycache__/
 bot.lock
 data.json
 memory.json
+search_cache.json
+vision_cache.json
+gen_hashes.json
+topic_cache.json
+meme_cache.json
 
 # 本地测试用的对比图
 _compare/

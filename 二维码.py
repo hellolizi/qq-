@@ -21,7 +21,6 @@ from PIL import Image, ImageOps
 
 ROOT = Path(__file__).resolve().parent
 CACHE = ROOT / "NapCat" / "cache"
-DST = ROOT / "二维码.png"
 
 FRESH_SECONDS = 600   # 超过这个岁数的码算过期,别画出来让人扫
 SAME_BATCH = 120      # 同一批文件里按这个时间窗挑最大的(最清晰)
@@ -31,10 +30,8 @@ QUIET = 3             # 左右各留几个字符的静默区,没有它扫不出�
 
 
 def candidates() -> list[Path]:
-    """库里所有可能是二维码的图:NapCat 缓存里的 + 我们自己存的。"""
+    """NapCat 缓存里所有可能是二维码的图。"""
     files = list(CACHE.glob("qrcode*.png"))
-    if DST.exists():
-        files.append(DST)
     return [p for p in files if time.time() - p.stat().st_mtime < FRESH_SECONDS]
 
 
@@ -54,8 +51,6 @@ def pick(files: list[Path]) -> tuple[Image.Image, Path] | None:
             continue
         if img.width >= MIN_PIXELS:
             img = img.convert("L")
-            if path != DST:
-                img.save(DST)  # 顺手覆盖存一份,方便手动扫
             return img, path
     return None
 
@@ -155,13 +150,16 @@ def render(img: Image.Image, width: int, top_blank: bool = True) -> str:
     return "\n".join(lines)
 
 
-def fallback(msg: str) -> str:
+def fallback(msg: str, path: Path | None) -> str:
     print(msg)
     print("  已经用图片窗口打开了,扫完关掉它就行。")
+    if not path:
+        print("  (没拿到源文件,手动去 NapCat/cache 里翻一下)")
+        return "window"
     try:
-        os.startfile(DST)  # noqa: S606
+        os.startfile(path)  # noqa: S606
     except Exception as exc:  # noqa: BLE001
-        print(f"  图片也没打开({exc}),手动开一下 {DST.name} 吧")
+        print(f"  图片也没打开({exc}),手动开一下 {path.name} 吧")
     return "window"
 
 
@@ -171,7 +169,10 @@ def paint(text: str, newline: bool = True) -> None:
     sys.stdout.flush()
 
 
-def draw(img: Image.Image, header: str = "", clear: bool = False) -> str:
+def draw(
+    img: Image.Image, header: str = "", clear: bool = False,
+    path: Path | None = None,
+) -> str:
     """把码画出来,返回画法:term(宽裕,能放大) / compact(塞满窗口) / window(放不下弹图片)。"""
     fit_console(120, 70)
     cols, lines = term_size()
@@ -186,7 +187,8 @@ def draw(img: Image.Image, header: str = "", clear: bool = False) -> str:
 
     if cols < need_cols or lines < qr_lines:
         return fallback(
-            f"  终端窗口放不下这张码(要 {need_cols} 列 x {qr_lines} 行,现在 {cols}x{lines}),"
+            f"  终端窗口放不下这张码(要 {need_cols} 列 x {qr_lines} 行,现在 {cols}x{lines}),",
+            path,
         )
 
     if lines >= qr_lines + 4:
@@ -268,6 +270,7 @@ def main() -> int:
                     if first
                     else "\n这张码刷新了(旧的一张超过 1 分钟会失效),请扫这张新的:",
                     clear=not first,
+                    path=source,
                 )
                 if not args.watch and mode != "compact" and not hint_printed:
                     print("\n扫完不用按键;码过期我会自动换新的。")
